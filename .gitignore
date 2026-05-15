@@ -1,0 +1,6 @@
+/target/
+/node_modules/
+/apps/renderer/node_modules/
+/apps/renderer/dist/
+/.worktrees/
+/.widgex/

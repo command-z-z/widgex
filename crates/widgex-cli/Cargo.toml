@@ -1,0 +1,19 @@
+[package]
+name = "widgex"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+directories.workspace = true
+serde_json.workspace = true
+widgex-core = { path = "../widgex-core" }
+widgex-ipc = { path = "../widgex-ipc" }
+widgex-webview = { path = "../widgex-webview" }
+widgexd = { path = "../widgexd" }
+
+[dev-dependencies]
+tempfile.workspace = true

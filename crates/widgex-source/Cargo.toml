@@ -1,0 +1,13 @@
+[package]
+name = "widgex-source"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono.workspace = true
+widgex-core = { path = "../widgex-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

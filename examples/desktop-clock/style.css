@@ -1,0 +1,13 @@
+.widgex-window {
+  color: #f5f7fb;
+  background: transparent;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  background: rgba(18, 22, 31, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+}
+
+.clock-time {
+  font-size: 28px;
+  font-weight: 600;
+}

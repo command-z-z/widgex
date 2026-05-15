@@ -1,0 +1,37 @@
+version = 1
+
+[theme]
+css = "style.css"
+
+[[sources]]
+id = "clock"
+kind = "time"
+interval_ms = 1000
+
+[[sources]]
+id = "battery"
+kind = "battery"
+interval_ms = 5000
+
+[[windows]]
+id = "top-bar"
+title = "Widgex Top Bar"
+layer = "top"
+anchor = ["top", "left", "right"]
+exclusive_zone = 32
+
+[windows.size]
+height = 32
+
+[[windows.widgets]]
+type = "box"
+direction = "row"
+
+[[windows.widgets.children]]
+type = "label"
+text = "{{ clock.now }}"
+
+[[windows.widgets.children]]
+type = "label"
+class = ["battery"]
+text = "BAT {{ battery.level }} · {{ battery.status }}"
