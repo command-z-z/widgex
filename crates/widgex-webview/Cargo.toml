@@ -10,7 +10,11 @@ anyhow.workspace = true
 gtk.workspace = true
 gtk-layer-shell.workspace = true
 rust-embed = "8"
+serde.workspace = true
 serde_json.workspace = true
 widgex-core = { path = "../widgex-core" }
 widgex-source = { path = "../widgex-source" }
 wry = "0.55"
+
+[dev-dependencies]
+tempfile.workspace = true

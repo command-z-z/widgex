@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
     time::SystemTime,
@@ -256,6 +257,9 @@ impl WidgetProcessManager {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            // Put each widget and its shell listeners in their own process
+            // group so closing a window also reaps playerctl -F/metadata.py.
+            .process_group(0)
             .spawn()
             .with_context(|| format!("failed to spawn {}", self.cli_path.display()))?;
 
@@ -265,7 +269,13 @@ impl WidgetProcessManager {
 
     fn stop_window(&mut self, window_id: &str) -> Result<()> {
         if let Some(mut child) = self.children.remove(window_id) {
-            let _ = child.kill();
+            let pid = child.id() as i32;
+            // SAFETY: `pid` is the child process group id because spawn_window
+            // uses process_group(0). Fall back to killing the child if killpg
+            // fails, e.g. if it already exited.
+            if unsafe { libc::killpg(pid, libc::SIGTERM) } != 0 {
+                let _ = child.kill();
+            }
             let _ = child.wait();
         }
         Ok(())

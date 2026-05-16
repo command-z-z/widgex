@@ -9,6 +9,44 @@ Widgex starts with TOML because it is easy to validate, generate, and edit with 
 - Every window needs a stable `id`.
 - Every window needs at least one `[[windows.widgets]]` entry.
 
+## Modules
+
+Large setups can keep the root config small and load window modules explicitly:
+
+```toml
+version = 1
+modules = [
+  "shared/lyrics.toml",
+  "widgets/dashboard/dashboard.toml",
+]
+
+[theme]
+css = "styles/base.css"
+```
+
+A module may define data sources, windows, and one CSS file:
+
+```toml
+css = "dashboard.css"
+
+[[sources]]
+id = "metadata"
+kind = "shell"
+mode = "listen"
+format = "json"
+command = "/usr/bin/python ./src/metadata.py"
+
+[[windows]]
+id = "dashboard"
+
+[[windows.widgets]]
+type = "label"
+text = "{{ metadata.title }}"
+```
+
+Module paths are resolved from the root config. A module's `css` path is
+resolved from that module file, then concatenated after the root theme CSS.
+
 ## Security
 
 Shell sources are disabled by default. A config that uses `kind = "shell"` must opt in explicitly:

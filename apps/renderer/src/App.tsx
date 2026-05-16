@@ -1,5 +1,10 @@
-import { createSignal, For, Show } from "solid-js";
-import type { NormalizedWidgetNode, RawWidgetNode } from "./widgetTree";
+import { createEffect, createSignal, For, onCleanup } from "solid-js";
+import { createStore, reconcile } from "solid-js/store";
+import type {
+  NormalizedWidgetNode,
+  RawWidgetNode,
+  WidgetAction,
+} from "./widgetTree";
 import { normalizeWidgetTree } from "./widgetTree";
 
 /** Mirrors the Rust `RendererPayload`. Widget `text`/`value` arrive already
@@ -13,6 +18,7 @@ type RendererWindow = {
 type RendererPayload = {
   version: number;
   theme_css: string | null;
+  theme_css_files?: string[];
   windows: RendererWindow[];
 };
 
@@ -22,6 +28,9 @@ declare global {
     __WIDGEX_PAYLOAD__?: RendererPayload;
     /** Live update hook the host calls on every poll tick. */
     __widgexPush?: (payload: RendererPayload) => void;
+    ipc?: {
+      postMessage: (message: string) => void;
+    };
   }
 }
 
@@ -32,23 +41,32 @@ const EMPTY_PAYLOAD: RendererPayload = {
 };
 
 export function App() {
-  const [payload, setPayload] = createSignal<RendererPayload>(
-    window.__WIDGEX_PAYLOAD__ ?? EMPTY_PAYLOAD,
+  const initial = window.__WIDGEX_PAYLOAD__ ?? EMPTY_PAYLOAD;
+
+  // createStore + reconcile: each push patches widget objects in-place on the
+  // same Proxy references. <For> sees stable identities → never unmounts nodes
+  // → button click handlers are always live, no dropped clicks.
+  const [widgets, setWidgets] = createStore(
+    normalizeWidgetTree(initial.windows[0]?.widgets ?? []),
   );
+  const [themeCss, setThemeCss] = createSignal(initial.theme_css ?? "");
 
-  // Register before the first poll tick so no update is dropped.
-  window.__widgexPush = (next) => setPayload(next);
+  window.__widgexPush = (next) => {
+    setWidgets(reconcile(normalizeWidgetTree(next.windows[0]?.widgets ?? [])));
+    setThemeCss(next.theme_css ?? "");
+  };
 
-  const widgets = () =>
-    normalizeWidgetTree(payload().windows[0]?.widgets ?? []);
-  const themeCss = () => payload().theme_css ?? "";
+  const styleElement = document.createElement("style");
+  styleElement.dataset.widgexTheme = "true";
+  document.head.appendChild(styleElement);
+  createEffect(() => {
+    styleElement.textContent = themeCss();
+  });
+  onCleanup(() => styleElement.remove());
 
   return (
     <main class="widgex-window">
-      <Show when={themeCss()}>
-        <style>{themeCss()}</style>
-      </Show>
-      <WidgetList widgets={widgets()} />
+      <WidgetList widgets={widgets} />
     </main>
   );
 }
@@ -65,6 +83,17 @@ function classList(base: string, extra?: string[]): string {
   return extra && extra.length > 0 ? `${base} ${extra.join(" ")}` : base;
 }
 
+function sendAction(action?: WidgetAction, value?: string) {
+  if (!action) return;
+  window.ipc?.postMessage(JSON.stringify({ action, value }));
+}
+
+function progressStyle(widget: NormalizedWidgetNode): string {
+  const value = Math.max(0, Math.min(100, Number(widget.value) || 0));
+  const base = widget.style ? `${widget.style}; ` : "";
+  return `${base}--widgex-progress-value: ${value}`;
+}
+
 function WidgetNode(props: { widget: NormalizedWidgetNode }) {
   const widget = props.widget;
 
@@ -76,36 +105,49 @@ function WidgetNode(props: { widget: NormalizedWidgetNode }) {
             `widgex-box widgex-box-${widget.direction ?? "row"}`,
             widget.class,
           )}
+          style={widget.style}
         >
           <WidgetList widgets={widget.children} />
         </div>
       );
     case "label":
       return (
-        <span class={classList("widgex-label", widget.class)}>
+        <span class={classList("widgex-label", widget.class)} style={widget.style}>
           {widget.text}
         </span>
       );
     case "button":
       return (
-        <button class={classList("widgex-button", widget.class)}>
+        <button
+          class={classList("widgex-button", widget.class)}
+          style={widget.style}
+          onClick={() => sendAction(widget.on_click)}
+        >
           {widget.text}
         </button>
       );
     case "image":
       return (
-        <img class={classList("widgex-image", widget.class)} src={widget.src} />
+        <img
+          class={classList("widgex-image", widget.class)}
+          src={widget.src}
+          style={widget.style}
+        />
       );
     case "progress":
       return (
-        <progress
+        <input
+          type="range"
           class={classList("widgex-progress", widget.class)}
-          max="1"
+          min="0"
+          max="100"
           value={Number(widget.value) || 0}
+          style={progressStyle(widget)}
+          onChange={(event) => sendAction(widget.on_change, event.currentTarget.value)}
         />
       );
     case "spacer":
-      return <div class={classList("widgex-spacer", widget.class)} />;
+      return <div class={classList("widgex-spacer", widget.class)} style={widget.style} />;
     case "error":
       return <span class="widgex-error">{widget.text}</span>;
     default:

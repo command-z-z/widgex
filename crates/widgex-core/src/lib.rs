@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub version: u16,
     #[serde(default)]
+    pub modules: Vec<String>,
+    #[serde(default)]
     pub theme: Option<Theme>,
     #[serde(default)]
     pub permissions: Permissions,
@@ -18,6 +20,9 @@ pub struct Config {
     pub sources: Vec<DataSource>,
     #[serde(default)]
     pub windows: Vec<WindowSpec>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub css_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -37,11 +42,31 @@ pub struct DataSource {
     pub id: String,
     pub kind: SourceKind,
     #[serde(default)]
+    pub mode: SourceMode,
+    #[serde(default)]
+    pub format: SourceFormat,
+    #[serde(default)]
     pub interval_ms: Option<u64>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceMode {
+    #[default]
+    Poll,
+    Listen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -131,9 +156,13 @@ pub struct WidgetNode {
     #[serde(default)]
     pub src: Option<String>,
     #[serde(default)]
+    pub style: Option<String>,
+    #[serde(default)]
     pub direction: Option<Direction>,
     #[serde(default)]
     pub on_click: Option<Action>,
+    #[serde(default)]
+    pub on_change: Option<Action>,
     #[serde(default)]
     pub children: Vec<WidgetNode>,
 }
@@ -203,6 +232,8 @@ pub struct ConfigDiagnostic {
 pub struct RendererPayload {
     pub version: u16,
     pub theme_css: Option<String>,
+    #[serde(default)]
+    pub theme_css_files: Vec<String>,
     pub windows: Vec<RendererWindow>,
     pub sources: Vec<RendererSource>,
 }
@@ -225,6 +256,8 @@ pub struct RendererWindow {
 pub struct RendererSource {
     pub id: String,
     pub kind: SourceKind,
+    pub mode: SourceMode,
+    pub format: SourceFormat,
     pub interval_ms: Option<u64>,
 }
 
@@ -237,7 +270,10 @@ pub struct RendererWidget {
     pub text: Option<String>,
     pub value: Option<String>,
     pub src: Option<String>,
+    pub style: Option<String>,
     pub direction: Option<Direction>,
+    pub on_click: Option<Action>,
+    pub on_change: Option<Action>,
     pub bindings: Option<RendererWidgetBindings>,
     pub children: Vec<RendererWidget>,
 }
@@ -246,6 +282,8 @@ pub struct RendererWidget {
 pub struct RendererWidgetBindings {
     pub text: Vec<String>,
     pub value: Vec<String>,
+    pub src: Vec<String>,
+    pub style: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -276,7 +314,8 @@ pub fn parse_config_file(path: impl AsRef<Path>) -> Result<Config, Vec<ConfigDia
         )]
     })?;
 
-    parse_config_str(&input)
+    let config = parse_config_str(&input)?;
+    expand_config_modules(config, path)
 }
 
 pub fn validate_config(config: &Config) -> Result<(), Vec<ConfigDiagnostic>> {
@@ -337,6 +376,14 @@ pub fn validate_config(config: &Config) -> Result<(), Vec<ConfigDiagnostic>> {
                 ));
             }
         }
+
+        if source.mode == SourceMode::Listen && source.kind != SourceKind::Shell {
+            diagnostics.push(ConfigDiagnostic::new(
+                format!("sources[{index}].mode"),
+                "listen mode is only supported for shell sources",
+                "use kind = \"shell\" for long-running command sources",
+            ));
+        }
     }
 
     let source_ids: HashSet<&str> = config
@@ -363,10 +410,11 @@ pub fn validate_config(config: &Config) -> Result<(), Vec<ConfigDiagnostic>> {
         }
 
         for (widget_index, widget) in window.widgets.iter().enumerate() {
-            validate_widget_bindings(
+            validate_widget(
                 widget,
                 &format!("windows[{index}].widgets[{widget_index}]"),
                 &source_ids,
+                config.permissions.allow_shell,
                 &mut diagnostics,
             );
         }
@@ -393,6 +441,7 @@ pub fn renderer_payload_from_config(
     Ok(RendererPayload {
         version: config.version,
         theme_css: config.theme.as_ref().and_then(|theme| theme.css.clone()),
+        theme_css_files: config.css_files.clone(),
         windows: config
             .windows
             .iter()
@@ -419,10 +468,86 @@ pub fn renderer_payload_from_config(
             .map(|source| RendererSource {
                 id: source.id.clone(),
                 kind: source.kind,
+                mode: source.mode,
+                format: source.format,
                 interval_ms: source.interval_ms,
             })
             .collect(),
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConfigModule {
+    #[serde(default)]
+    css: Option<String>,
+    #[serde(default)]
+    sources: Vec<DataSource>,
+    #[serde(default)]
+    windows: Vec<WindowSpec>,
+}
+
+fn expand_config_modules(
+    mut config: Config,
+    root_path: &Path,
+) -> Result<Config, Vec<ConfigDiagnostic>> {
+    let root_dir = root_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut css_files = Vec::new();
+    if let Some(css) = config.theme.as_ref().and_then(|theme| theme.css.as_ref()) {
+        css_files.push(css.clone());
+    }
+
+    for module_ref in config.modules.clone() {
+        let module_path = resolve_path(root_dir, &module_ref);
+        let input = fs::read_to_string(&module_path).map_err(|error| {
+            vec![ConfigDiagnostic::new(
+                module_ref.clone(),
+                format!("failed to read module: {error}"),
+                "verify the module path exists and is readable",
+            )]
+        })?;
+        let module = parse_config_module(&input, &module_ref)?;
+        let module_dir = module_path.parent().unwrap_or(root_dir);
+
+        if let Some(css) = module.css {
+            let css_path = resolve_path(module_dir, &css);
+            css_files.push(path_relative_to_or_absolute(&css_path, root_dir));
+        }
+
+        config.sources.extend(module.sources);
+        config.windows.extend(module.windows);
+    }
+
+    config.css_files = css_files;
+    Ok(config)
+}
+
+fn parse_config_module(
+    input: &str,
+    module_ref: &str,
+) -> Result<ConfigModule, Vec<ConfigDiagnostic>> {
+    toml::from_str(input).map_err(|error| {
+        vec![ConfigDiagnostic::new(
+            module_ref,
+            format!("failed to parse module TOML: {error}"),
+            "check the surrounding table names, field names, and value types",
+        )]
+    })
+}
+
+fn resolve_path(base: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+fn path_relative_to_or_absolute(path: &Path, base: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
 }
 
 pub fn schema_json_pretty<T: JsonSchema>() -> Result<String, serde_json::Error> {
@@ -482,6 +607,12 @@ fn resolve_widget(widget: &mut RendererWidget, snapshots: &[SourceSnapshot]) {
     }
     if let Some(value) = &widget.value {
         widget.value = Some(resolve_template(value, snapshots));
+    }
+    if let Some(src) = &widget.src {
+        widget.src = Some(resolve_template(src, snapshots));
+    }
+    if let Some(style) = &widget.style {
+        widget.style = Some(resolve_template(style, snapshots));
     }
     for child in &mut widget.children {
         resolve_widget(child, snapshots);
@@ -569,13 +700,19 @@ fn collect_duplicate_ids<'a>(
     }
 }
 
-fn validate_widget_bindings(
+fn validate_widget(
     widget: &WidgetNode,
     path: &str,
     source_ids: &HashSet<&str>,
+    allow_shell: bool,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
-    for (field, value) in [("text", &widget.text), ("value", &widget.value)] {
+    for (field, value) in [
+        ("text", &widget.text),
+        ("value", &widget.value),
+        ("src", &widget.src),
+        ("style", &widget.style),
+    ] {
         let Some(value) = value else {
             continue;
         };
@@ -601,11 +738,25 @@ fn validate_widget_bindings(
         }
     }
 
+    for (field, action) in [
+        ("on_click", &widget.on_click),
+        ("on_change", &widget.on_change),
+    ] {
+        if matches!(action, Some(Action::Command { .. })) && !allow_shell {
+            diagnostics.push(ConfigDiagnostic::new(
+                format!("{path}.{field}"),
+                "command action requires permissions.allow_shell",
+                "add [permissions] allow_shell = true after reviewing the command",
+            ));
+        }
+    }
+
     for (index, child) in widget.children.iter().enumerate() {
-        validate_widget_bindings(
+        validate_widget(
             child,
             &format!("{path}.children[{index}]"),
             source_ids,
+            allow_shell,
             diagnostics,
         );
     }
@@ -619,7 +770,10 @@ fn renderer_widget_from_config(widget: &WidgetNode) -> RendererWidget {
         text: widget.text.clone(),
         value: widget.value.clone(),
         src: widget.src.clone(),
+        style: widget.style.clone(),
         direction: widget.direction,
+        on_click: widget.on_click.clone(),
+        on_change: widget.on_change.clone(),
         bindings: renderer_bindings_for_widget(widget),
         children: widget
             .children
@@ -630,24 +784,28 @@ fn renderer_widget_from_config(widget: &WidgetNode) -> RendererWidget {
 }
 
 fn renderer_bindings_for_widget(widget: &WidgetNode) -> Option<RendererWidgetBindings> {
-    let text = widget
-        .text
-        .as_deref()
-        .and_then(|value| Binding::parse(value).ok())
-        .map(|binding| binding.references)
-        .unwrap_or_default();
-    let value = widget
-        .value
-        .as_deref()
-        .and_then(|value| Binding::parse(value).ok())
-        .map(|binding| binding.references)
-        .unwrap_or_default();
+    let text = binding_references(widget.text.as_deref());
+    let value = binding_references(widget.value.as_deref());
+    let src = binding_references(widget.src.as_deref());
+    let style = binding_references(widget.style.as_deref());
 
-    if text.is_empty() && value.is_empty() {
+    if text.is_empty() && value.is_empty() && src.is_empty() && style.is_empty() {
         None
     } else {
-        Some(RendererWidgetBindings { text, value })
+        Some(RendererWidgetBindings {
+            text,
+            value,
+            src,
+            style,
+        })
     }
+}
+
+fn binding_references(value: Option<&str>) -> Vec<String> {
+    value
+        .and_then(|value| Binding::parse(value).ok())
+        .map(|binding| binding.references)
+        .unwrap_or_default()
 }
 
 pub fn default_config_path() -> PathBuf {

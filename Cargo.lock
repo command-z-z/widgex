@@ -2624,6 +2624,7 @@ name = "widgex-source"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "serde_json",
  "tempfile",
  "widgex-core",
 ]
@@ -2636,7 +2637,9 @@ dependencies = [
  "gtk",
  "gtk-layer-shell",
  "rust-embed",
+ "serde",
  "serde_json",
+ "tempfile",
  "widgex-core",
  "widgex-source",
  "wry",
@@ -2648,6 +2651,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

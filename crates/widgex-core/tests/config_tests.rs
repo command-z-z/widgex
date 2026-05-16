@@ -1,5 +1,8 @@
+use std::fs;
+
 use widgex_core::{
-    Binding, Config, ConfigDiagnostic, SourceKind, SourceSnapshot, WidgetKind, parse_config_str,
+    Action, Binding, Config, ConfigDiagnostic, SourceFormat, SourceKind, SourceMode,
+    SourceSnapshot, WidgetKind, load_validated_config, parse_config_str,
     renderer_payload_from_config, resolve_payload, resolve_template, schema_json_pretty,
     validate_config,
 };
@@ -125,6 +128,36 @@ text = "{{ uptime.stdout }}"
 }
 
 #[test]
+fn rejects_command_actions_unless_permission_is_enabled() {
+    let config = parse_config_str(
+        r#"
+version = 1
+
+[[windows]]
+id = "controls"
+
+[[windows.widgets]]
+type = "button"
+text = "Play"
+
+[windows.widgets.on_click]
+type = "command"
+command = "playerctl play-pause"
+"#,
+    )
+    .expect("config syntax should parse");
+
+    let diagnostics = validate_config(&config).expect_err("command action should be rejected");
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "windows[0].widgets[0].on_click"
+            && diagnostic
+                .message
+                .contains("command action requires permissions.allow_shell")
+    }));
+}
+
+#[test]
 fn extracts_binding_references_from_template_text() {
     let binding = Binding::parse("CPU {{ cpu.percent }} MEM {{ memory.used }}").unwrap();
 
@@ -138,6 +171,7 @@ fn schema_contains_public_config_sections() {
     assert!(schema.contains("\"windows\""));
     assert!(schema.contains("\"sources\""));
     assert!(schema.contains("\"permissions\""));
+    assert!(schema.contains("\"modules\""));
 }
 
 #[test]
@@ -183,6 +217,85 @@ fn resolve_payload_rewrites_widget_text_in_place() {
     assert_eq!(
         resolved.windows[0].widgets[0].children[0].text.as_deref(),
         Some("09:00:00")
+    );
+}
+
+#[test]
+fn resolves_src_and_style_bindings_in_payload() {
+    let config = parse_config_str(
+        r##"
+version = 1
+
+[[sources]]
+id = "metadata"
+kind = "shell"
+mode = "listen"
+format = "json"
+command = "printf '{}'"
+
+[permissions]
+allow_shell = true
+
+[[windows]]
+id = "music"
+
+[[windows.widgets]]
+type = "box"
+style = "background-image:url('{{ metadata.image }}')"
+
+[[windows.widgets.children]]
+type = "image"
+src = "{{ metadata.image }}"
+"##,
+    )
+    .expect("config syntax should parse");
+
+    let payload = renderer_payload_from_config(&config).expect("config should validate");
+    let snapshot = SourceSnapshot::new("metadata").with_field("image", "./cover.png");
+    let resolved = resolve_payload(&payload, &[snapshot]);
+
+    assert_eq!(payload.sources[0].mode, SourceMode::Listen);
+    assert_eq!(payload.sources[0].format, SourceFormat::Json);
+    assert_eq!(
+        resolved.windows[0].widgets[0].style.as_deref(),
+        Some("background-image:url('./cover.png')")
+    );
+    assert_eq!(
+        resolved.windows[0].widgets[0].children[0].src.as_deref(),
+        Some("./cover.png")
+    );
+}
+
+#[test]
+fn renderer_payload_carries_widget_actions() {
+    let config = parse_config_str(
+        r#"
+version = 1
+
+[permissions]
+allow_shell = true
+
+[[windows]]
+id = "controls"
+
+[[windows.widgets]]
+type = "progress"
+value = "20"
+
+[windows.widgets.on_change]
+type = "command"
+command = "./seek.sh {}"
+"#,
+    )
+    .expect("config syntax should parse");
+
+    let payload = renderer_payload_from_config(&config).expect("config should validate");
+
+    assert_eq!(
+        payload.windows[0].widgets[0].on_change,
+        Some(Action::Command {
+            command: "./seek.sh {}".to_string()
+        })
     );
 }
 
@@ -269,4 +382,78 @@ text = "{{ clock.now }}"
             .text,
         vec!["clock.now"]
     );
+}
+
+#[test]
+fn load_validated_config_merges_explicit_modules_and_css_files() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("widgets/dashboard")).unwrap();
+    fs::create_dir_all(dir.path().join("shared")).unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        r#"
+version = 1
+modules = [
+  "shared/lyrics.toml",
+  "widgets/dashboard/dashboard.toml",
+]
+
+[theme]
+css = "styles/base.css"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("shared/lyrics.toml"),
+        r#"
+[[sources]]
+id = "lyrics"
+kind = "time"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("widgets/dashboard/dashboard.toml"),
+        r#"
+css = "dashboard.css"
+
+[[windows]]
+id = "dashboard"
+
+[[windows.widgets]]
+type = "label"
+text = "{{ lyrics.now }}"
+"#,
+    )
+    .unwrap();
+
+    let config = load_validated_config(dir.path().join("config.toml")).unwrap();
+    let payload = renderer_payload_from_config(&config).unwrap();
+
+    assert_eq!(config.sources[0].id, "lyrics");
+    assert_eq!(config.windows[0].id, "dashboard");
+    assert_eq!(
+        payload.theme_css_files,
+        vec!["styles/base.css", "widgets/dashboard/dashboard.css"]
+    );
+}
+
+#[test]
+fn load_validated_config_reports_missing_module_path() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        r#"
+version = 1
+modules = ["widgets/missing.toml"]
+"#,
+    )
+    .unwrap();
+
+    let diagnostics = load_validated_config(dir.path().join("config.toml")).unwrap_err();
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "widgets/missing.toml"
+            && diagnostic.message.contains("failed to read module")
+    }));
 }
