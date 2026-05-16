@@ -88,6 +88,11 @@ function sendAction(action?: WidgetAction, value?: string) {
   window.ipc?.postMessage(JSON.stringify({ action, value }));
 }
 
+function stopAndSendAction(event: MouseEvent, action?: WidgetAction) {
+  event.stopPropagation();
+  sendAction(action);
+}
+
 function progressStyle(widget: NormalizedWidgetNode): string {
   const value = Math.max(0, Math.min(100, Number(widget.value) || 0));
   const base = widget.style ? `${widget.style}; ` : "";
@@ -106,6 +111,7 @@ function WidgetNode(props: { widget: NormalizedWidgetNode }) {
             widget.class,
           )}
           style={widget.style}
+          onClick={() => sendAction(widget.on_click)}
         >
           <WidgetList widgets={widget.children} />
         </div>
@@ -121,7 +127,7 @@ function WidgetNode(props: { widget: NormalizedWidgetNode }) {
         <button
           class={classList("widgex-button", widget.class)}
           style={widget.style}
-          onClick={() => sendAction(widget.on_click)}
+          onClick={(event) => stopAndSendAction(event, widget.on_click)}
         >
           {widget.text}
         </button>
