@@ -5,8 +5,17 @@ export type RawWidgetNode = {
   text?: string;
   value?: string;
   src?: string;
+  style?: string;
   direction?: "row" | "column";
+  on_click?: WidgetAction;
+  on_change?: WidgetAction;
   children?: RawWidgetNode[];
+};
+
+export type WidgetAction = {
+  type: "command" | "emit";
+  command?: string;
+  event?: string;
 };
 
 export type NormalizedWidgetNode = {
@@ -16,7 +25,10 @@ export type NormalizedWidgetNode = {
   text?: string;
   value?: string;
   src?: string;
+  style?: string;
   direction?: "row" | "column";
+  on_click?: WidgetAction;
+  on_change?: WidgetAction;
   children: NormalizedWidgetNode[];
 };
 
@@ -44,14 +56,18 @@ function normalizeWidget(widget: RawWidgetNode): NormalizedWidgetNode {
     };
   }
 
-  return {
+  const normalized: NormalizedWidgetNode = {
     type: widget.type,
-    id: widget.id,
-    class: widget.class,
-    text: widget.text,
-    value: widget.value,
-    src: widget.src,
-    direction: widget.direction,
     children: normalizeWidgetTree(widget.children ?? []),
   };
+  if (widget.id !== undefined) normalized.id = widget.id;
+  if (widget.class !== undefined) normalized.class = widget.class;
+  if (widget.text !== undefined) normalized.text = widget.text;
+  if (widget.value !== undefined) normalized.value = widget.value;
+  if (widget.src !== undefined) normalized.src = widget.src;
+  if (widget.style !== undefined) normalized.style = widget.style;
+  if (widget.direction !== undefined) normalized.direction = widget.direction;
+  if (widget.on_click !== undefined) normalized.on_click = widget.on_click;
+  if (widget.on_change !== undefined) normalized.on_change = widget.on_change;
+  return normalized;
 }

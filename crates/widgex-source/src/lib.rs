@@ -1,14 +1,14 @@
 //! Data source engine: turns config [`DataSource`] entries into live
 //! [`SourceSnapshot`] readings the renderer can bind against.
 //!
-//! This milestone implements the `time` and `battery` source kinds. The other
-//! kinds (`cpu`, `memory`, `network`, `shell`) parse and validate but produce
-//! empty snapshots until a later milestone.
+//! This milestone implements the `time`, `battery`, and shell command source
+//! kinds. Other system sources parse and validate but produce empty snapshots
+//! until a later milestone.
 
-use std::{collections::BTreeMap, fs, path::Path, time::Duration};
+use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
 
 use chrono::Local;
-use widgex_core::{DataSource, SourceKind, SourceSnapshot};
+use widgex_core::{DataSource, SourceFormat, SourceKind, SourceMode, SourceSnapshot};
 
 /// Where the Linux kernel exposes battery state.
 const POWER_SUPPLY_BASE: &str = "/sys/class/power_supply";
@@ -18,18 +18,32 @@ const DEFAULT_INTERVAL_MS: u64 = 1000;
 
 /// Poll every source once, returning one snapshot per source.
 pub fn poll_all(sources: &[DataSource]) -> Vec<SourceSnapshot> {
-    sources.iter().map(poll_source).collect()
+    poll_all_with_dir(sources, Path::new("."))
+}
+
+/// Poll every non-listen source with shell commands resolved relative to
+/// `cwd`.
+pub fn poll_all_with_dir(sources: &[DataSource], cwd: &Path) -> Vec<SourceSnapshot> {
+    sources
+        .iter()
+        .filter(|source| source.mode == SourceMode::Poll)
+        .map(|source| poll_source_with_dir(source, cwd))
+        .collect()
 }
 
 /// Poll a single source for its current reading.
 pub fn poll_source(source: &DataSource) -> SourceSnapshot {
+    poll_source_with_dir(source, Path::new("."))
+}
+
+/// Poll a single source with shell commands resolved relative to `cwd`.
+pub fn poll_source_with_dir(source: &DataSource, cwd: &Path) -> SourceSnapshot {
     let mut snapshot = SourceSnapshot::new(&source.id);
     snapshot.fields = match source.kind {
         SourceKind::Time => time_fields(),
         SourceKind::Battery => read_battery(Path::new(POWER_SUPPLY_BASE)),
-        SourceKind::Cpu | SourceKind::Memory | SourceKind::Network | SourceKind::Shell => {
-            BTreeMap::new()
-        }
+        SourceKind::Shell => poll_shell(source, cwd),
+        SourceKind::Cpu | SourceKind::Memory | SourceKind::Network => BTreeMap::new(),
     };
     snapshot
 }
@@ -39,11 +53,65 @@ pub fn poll_source(source: &DataSource) -> SourceSnapshot {
 pub fn tick_interval(sources: &[DataSource]) -> Duration {
     let millis = sources
         .iter()
+        .filter(|source| source.mode == SourceMode::Poll)
         .filter_map(|source| source.interval_ms)
         .filter(|millis| *millis > 0)
         .min()
         .unwrap_or(DEFAULT_INTERVAL_MS);
     Duration::from_millis(millis)
+}
+
+/// Parse one shell command output into fields for a source snapshot.
+pub fn parse_shell_output(format: SourceFormat, output: &str) -> BTreeMap<String, String> {
+    match format {
+        SourceFormat::Text => BTreeMap::from([("value".to_string(), output.trim().to_string())]),
+        SourceFormat::Json => parse_json_fields(output),
+    }
+}
+
+fn poll_shell(source: &DataSource, cwd: &Path) -> BTreeMap<String, String> {
+    let Some(command) = source.command.as_deref() else {
+        return BTreeMap::new();
+    };
+
+    let Ok(output) = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .output()
+    else {
+        return BTreeMap::new();
+    };
+
+    if !output.status.success() {
+        return BTreeMap::new();
+    }
+
+    parse_shell_output(
+        source.format,
+        String::from_utf8_lossy(&output.stdout).as_ref(),
+    )
+}
+
+fn parse_json_fields(output: &str) -> BTreeMap<String, String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output.trim()) else {
+        return BTreeMap::new();
+    };
+
+    let Some(object) = value.as_object() else {
+        return BTreeMap::new();
+    };
+
+    object
+        .iter()
+        .map(|(key, value)| {
+            let value = value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 fn time_fields() -> BTreeMap<String, String> {
@@ -157,6 +225,8 @@ mod tests {
             DataSource {
                 id: "clock".into(),
                 kind: SourceKind::Time,
+                mode: SourceMode::Poll,
+                format: SourceFormat::Text,
                 interval_ms: Some(1000),
                 timeout_ms: None,
                 command: None,
@@ -164,9 +234,20 @@ mod tests {
             DataSource {
                 id: "battery".into(),
                 kind: SourceKind::Battery,
+                mode: SourceMode::Poll,
+                format: SourceFormat::Text,
                 interval_ms: Some(5000),
                 timeout_ms: None,
                 command: None,
+            },
+            DataSource {
+                id: "metadata".into(),
+                kind: SourceKind::Shell,
+                mode: SourceMode::Listen,
+                format: SourceFormat::Json,
+                interval_ms: Some(10),
+                timeout_ms: None,
+                command: Some("printf '{}'".into()),
             },
         ];
 
@@ -174,6 +255,47 @@ mod tests {
         assert_eq!(
             tick_interval(&[]),
             Duration::from_millis(DEFAULT_INTERVAL_MS)
+        );
+    }
+
+    #[test]
+    fn parses_text_shell_output_as_value_field() {
+        let fields = parse_shell_output(SourceFormat::Text, "Playing\n");
+
+        assert_eq!(fields.get("value").map(String::as_str), Some("Playing"));
+    }
+
+    #[test]
+    fn parses_json_shell_output_as_named_fields() {
+        let fields = parse_shell_output(
+            SourceFormat::Json,
+            r#"{"title":"Song","progress":42,"playing":true}"#,
+        );
+
+        assert_eq!(fields.get("title").map(String::as_str), Some("Song"));
+        assert_eq!(fields.get("progress").map(String::as_str), Some("42"));
+        assert_eq!(fields.get("playing").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn polls_shell_command_relative_to_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("value.txt"), "hello\n");
+        let source = DataSource {
+            id: "local".into(),
+            kind: SourceKind::Shell,
+            mode: SourceMode::Poll,
+            format: SourceFormat::Text,
+            interval_ms: None,
+            timeout_ms: None,
+            command: Some("cat value.txt".into()),
+        };
+
+        let snapshot = poll_source_with_dir(&source, dir.path());
+
+        assert_eq!(
+            snapshot.fields.get("value").map(String::as_str),
+            Some("hello")
         );
     }
 }

@@ -199,6 +199,7 @@ fn run_cli(cli: Cli) -> Result<CliOutput> {
                     config_dir,
                     window_id,
                     &config_model.sources,
+                    config_model.permissions.allow_shell,
                 )?;
                 Ok(CliOutput::Message("widget window closed".to_string()))
             }
