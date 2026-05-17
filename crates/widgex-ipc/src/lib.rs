@@ -100,3 +100,84 @@ impl DaemonResponse {
         Ok(serde_json::from_str(line.trim_end())?)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RendererRequest {
+    Open { window_id: String },
+    Close { window_id: String },
+    Stop,
+    Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererResponse {
+    pub ok: bool,
+    pub message: String,
+    #[serde(default)]
+    pub open_windows: Vec<String>,
+}
+
+impl RendererRequest {
+    pub fn to_json_line(&self) -> Result<String> {
+        Ok(format!("{}\n", serde_json::to_string(self)?))
+    }
+
+    pub fn from_json_line(line: &str) -> Result<Self> {
+        Ok(serde_json::from_str(line.trim_end())?)
+    }
+}
+
+impl RendererResponse {
+    pub fn ok(message: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            message: message.into(),
+            open_windows: Vec::new(),
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            message: message.into(),
+            open_windows: Vec::new(),
+        }
+    }
+
+    pub fn with_open_windows(mut self, mut open_windows: Vec<String>) -> Self {
+        open_windows.sort();
+        self.open_windows = open_windows;
+        self
+    }
+
+    pub fn to_json_line(&self) -> Result<String> {
+        Ok(format!("{}\n", serde_json::to_string(self)?))
+    }
+
+    pub fn from_json_line(line: &str) -> Result<Self> {
+        Ok(serde_json::from_str(line.trim_end())?)
+    }
+}
+
+pub fn send_renderer_request(
+    socket_path: impl AsRef<Path>,
+    request: &RendererRequest,
+) -> Result<RendererResponse> {
+    let socket_path = socket_path.as_ref();
+    let mut stream = UnixStream::connect(socket_path).with_context(|| {
+        format!(
+            "failed to connect to renderer socket {}",
+            socket_path.display()
+        )
+    })?;
+    stream
+        .write_all(request.to_json_line()?.as_bytes())
+        .context("failed to write renderer request")?;
+
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .context("failed to read renderer response")?;
+    RendererResponse::from_json_line(&line)
+}
