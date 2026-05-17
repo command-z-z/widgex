@@ -2636,11 +2636,13 @@ dependencies = [
  "anyhow",
  "gtk",
  "gtk-layer-shell",
+ "libc",
  "rust-embed",
  "serde",
  "serde_json",
  "tempfile",
  "widgex-core",
+ "widgex-ipc",
  "widgex-source",
  "wry",
 ]

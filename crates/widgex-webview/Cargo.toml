@@ -8,11 +8,13 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 gtk.workspace = true
+libc.workspace = true
 gtk-layer-shell.workspace = true
 rust-embed = "8"
 serde.workspace = true
 serde_json.workspace = true
 widgex-core = { path = "../widgex-core" }
+widgex-ipc = { path = "../widgex-ipc" }
 widgex-source = { path = "../widgex-source" }
 wry = "0.55"
 

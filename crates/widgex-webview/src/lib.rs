@@ -16,8 +16,10 @@
 
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
-    io::{BufRead, BufReader},
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    io::{self, BufRead, BufReader, Write},
+    os::unix::net::{UnixListener, UnixStream},
     path::Component,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -26,6 +28,9 @@ use std::{
     thread,
     time::Duration,
 };
+
+#[allow(unused_imports)]
+use libc;
 
 use anyhow::{Context, Result, anyhow};
 use gtk::prelude::*;
@@ -36,8 +41,9 @@ use widgex_core::{
     Action, AnchorEdge, DataSource, RendererPayload, RendererSource, RendererWidget,
     RendererWindow, SourceKind, SourceMode, SourceSnapshot, WindowLayer, resolve_payload,
 };
+use widgex_ipc::{RendererRequest, RendererResponse};
 use wry::{
-    WebViewBuilder, WebViewBuilderExtUnix,
+    WebContext, WebViewBuilder, WebViewBuilderExtUnix,
     http::{Request, Response, header::CONTENT_TYPE},
 };
 
@@ -144,13 +150,28 @@ pub fn run_widget_window(
     window.set_exclusive_zone(window_spec.exclusive_zone.unwrap_or(0));
 
     let listener_rx = start_listeners(sources, config_dir.clone());
-    let mut latest_listen_snapshots = BTreeMap::<String, SourceSnapshot>::new();
+    // Seed HyprlandEvent listen sources with the active workspace so workspace
+    // indicators are correct on first render, before the socket delivers any event.
+    let mut latest_listen_snapshots: BTreeMap<String, SourceSnapshot> =
+        widgex_source::seed_listen_snapshots(sources)
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
     // Empty snapshots for the initial render — window opens immediately without
     // blocking on shell commands. Real data arrives on the first poll tick (~500 ms).
     let initial = resolve_payload(&base, &[]);
     let init_script = format!(
         "window.__WIDGEX_PAYLOAD__ = {};",
         serde_json::to_string(&initial)?
+    );
+
+    // Pre-define __widgexPush as a queue so payloads sent before SolidJS
+    // finishes mounting are buffered rather than dropped. App.tsx drains this
+    // queue on mount and replaces the function with the real implementation.
+    let init_script = format!(
+        "{init_script}\
+        window.__widgex_queue=[];\
+        window.__widgexPush=function(p){{window.__widgex_queue.push(p);}};",
     );
 
     let webview = WebViewBuilder::new()
@@ -162,9 +183,10 @@ pub fn run_widget_window(
             move |id, request| serve_asset(id, request, &config_dir)
         })
         .with_ipc_handler({
-            let config_dir = config_dir.clone();
+            let action_dir = window_spec.working_dir.clone()
+                .unwrap_or_else(|| config_dir.clone());
             move |request: Request<String>| {
-                if let Err(error) = handle_widget_event(request.body(), &config_dir, allow_shell) {
+                if let Err(error) = handle_widget_event(request.body(), &action_dir, allow_shell) {
                     eprintln!("widgex ipc error: {error}");
                 }
             }
@@ -186,25 +208,460 @@ pub fn run_widget_window(
     let poll_rx = start_pollers(sources, config_dir.clone());
     let mut latest_poll_snapshots = BTreeMap::<String, SourceSnapshot>::new();
     let push_webview = Rc::clone(&webview);
-    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+    let mut last_pushed_json = String::new();
+    // 16 ms ≈ one display frame: listener events (e.g. Hyprland workspace switches)
+    // are drained within one frame instead of waiting up to 100 ms. We only call
+    // evaluate_script when the resolved JSON actually changed, so there is no
+    // extra IPC cost on ticks where nothing moved.
+    gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
+        let mut dirty = false;
         while let Ok(snapshot) = poll_rx.try_recv() {
             latest_poll_snapshots.insert(snapshot.id.clone(), snapshot);
+            dirty = true;
         }
-        drain_listener_snapshots(&listener_rx, &mut latest_listen_snapshots);
+        if drain_listener_snapshots(&listener_rx, &mut latest_listen_snapshots) {
+            dirty = true;
+        }
+        if !dirty {
+            return gtk::glib::ControlFlow::Continue;
+        }
         let mut snapshots: Vec<SourceSnapshot> = latest_poll_snapshots.values().cloned().collect();
         snapshots.extend(latest_listen_snapshots.values().cloned());
         let resolved = resolve_payload(&base, &snapshots);
         if let Ok(json) = serde_json::to_string(&resolved) {
-            let _ = push_webview.evaluate_script(&format!(
-                "window.__widgexPush && window.__widgexPush({json})"
-            ));
+            if json != last_pushed_json {
+                let _ = push_webview.evaluate_script(&format!(
+                    "window.__widgexPush && window.__widgexPush({json})"
+                ));
+                last_pushed_json = json;
+            }
         }
         gtk::glib::ControlFlow::Continue
     });
 
     gtk::main();
+    // Kill any shell-listen child processes that were spawned by listener threads.
+    // When the daemon launches this process it calls process_group(0), making our
+    // PID equal to our PGID. All listener-thread children inherit that group. If we
+    // are the group leader we send SIGTERM to the group (temporarily ignoring it
+    // ourselves) so orphaned children do not outlive the window close. When the user
+    // runs widgex --foreground directly in a terminal the PGID != PID check keeps us
+    // from killing unrelated processes in the terminal's process group.
+    #[cfg(unix)]
+    unsafe {
+        let my_pid = std::process::id() as libc::pid_t;
+        if libc::getpgid(0) == my_pid {
+            let saved = libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::killpg(my_pid, libc::SIGTERM);
+            libc::signal(libc::SIGTERM, saved);
+        }
+    }
     Ok(())
 }
+
+// ── Multi-window renderer ────────────────────────────────────────────────────
+
+/// Internal state shared between the GTK tick closure and open/close helpers.
+/// GTK is single-threaded, so `Rc<RefCell<…>>` is sufficient — no Arc/Mutex.
+struct RendererState {
+    windows: BTreeMap<String, ManagedWindow>,
+    global_poll_snapshots: BTreeMap<String, SourceSnapshot>,
+    global_listen_snapshots: BTreeMap<String, SourceSnapshot>,
+    base_payload: RendererPayload,
+    config_dir: PathBuf,
+    allow_shell: bool,
+}
+
+/// One GTK window + its webview, tracked by the multi-window runner.
+struct ManagedWindow {
+    gtk_window: gtk::Window,
+    webview: Rc<wry::WebView>,
+    last_pushed_json: String,
+}
+
+/// Open the selected widget window as a layer-shell-anchored webview.
+/// Uses a shared `WebContext` so all windows share one WebKit network process.
+///
+/// Returns the `ManagedWindow` on success. The caller must insert it into
+/// `state.windows`.
+fn add_window(
+    window_id: &str,
+    state: &RendererState,
+    web_context: &mut WebContext,
+    destroyed_ids: Rc<RefCell<BTreeSet<String>>>,
+) -> Result<ManagedWindow> {
+    let window_spec = select_window(&state.base_payload, Some(window_id))?.clone();
+
+    let window = gtk::Window::new(gtk::WindowType::Toplevel);
+    window.set_title(window_spec.title.as_deref().unwrap_or(&window_spec.id));
+    window.set_decorated(false);
+    window.set_app_paintable(true);
+
+    let width = window_spec.size.width.map_or(-1, |v| v as i32);
+    let height = window_spec.size.height.map_or(-1, |v| v as i32);
+    window.set_size_request(width, height);
+    window.set_default_size(
+        window_spec.size.width.unwrap_or(DEFAULT_WIDTH) as i32,
+        window_spec.size.height.unwrap_or(DEFAULT_HEIGHT) as i32,
+    );
+
+    window.init_layer_shell();
+    window.set_namespace("widgex");
+    window.set_layer(map_layer(window_spec.layer));
+    window.set_keyboard_mode(KeyboardMode::None);
+
+    for edge in [
+        AnchorEdge::Top,
+        AnchorEdge::Right,
+        AnchorEdge::Bottom,
+        AnchorEdge::Left,
+    ] {
+        window.set_anchor(map_edge(edge), window_spec.anchor.contains(&edge));
+    }
+    window.set_layer_shell_margin(Edge::Top, window_spec.margin.top as i32);
+    window.set_layer_shell_margin(Edge::Right, window_spec.margin.right as i32);
+    window.set_layer_shell_margin(Edge::Bottom, window_spec.margin.bottom as i32);
+    window.set_layer_shell_margin(Edge::Left, window_spec.margin.left as i32);
+    window.set_exclusive_zone(window_spec.exclusive_zone.unwrap_or(0));
+
+    // Seed the initial payload (empty snapshots; real data arrives shortly).
+    let initial = resolve_payload(&state.base_payload, &[]);
+    let init_script = format!(
+        "window.__WIDGEX_PAYLOAD__ = {};\
+         window.__widgex_queue=[];\
+         window.__widgexPush=function(p){{window.__widgex_queue.push(p);}};",
+        serde_json::to_string(&initial)?
+    );
+
+    let config_dir = state.config_dir.clone();
+    let allow_shell = state.allow_shell;
+    let action_dir = window_spec
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| config_dir.clone());
+
+    // The "widgex" custom protocol is registered once on the shared WebContext.
+    // Subsequent calls with the same context must NOT re-register it.
+    let protocol_already_registered = web_context.is_custom_protocol_registered("widgex");
+
+    let builder = WebViewBuilder::new_with_web_context(web_context)
+        .with_url("widgex://localhost/index.html")
+        .with_transparent(true)
+        .with_initialization_script(init_script)
+        .with_ipc_handler({
+            move |request: Request<String>| {
+                if let Err(e) = handle_widget_event(request.body(), &action_dir, allow_shell) {
+                    eprintln!("widgex ipc error: {e}");
+                }
+            }
+        });
+
+    let builder = if protocol_already_registered {
+        builder
+    } else {
+        builder.with_custom_protocol("widgex".to_string(), {
+            let config_dir = config_dir.clone();
+            move |id, request| serve_asset(id, request, &config_dir)
+        })
+    };
+
+    let webview = builder
+        .build_gtk(&window)
+        .map_err(|e| anyhow!("failed to create webview: {e}"))?;
+    let webview = Rc::new(webview);
+
+    window.show_all();
+    if window_spec.click_through {
+        let empty_input = gtk::cairo::Region::create();
+        window.input_shape_combine_region(Some(&empty_input));
+    }
+
+    // Notify the tick loop that this window was destroyed (e.g. user closed it).
+    let id_for_destroy = window_id.to_string();
+    window.connect_destroy(move |_| {
+        destroyed_ids.borrow_mut().insert(id_for_destroy.clone());
+    });
+
+    Ok(ManagedWindow {
+        gtk_window: window,
+        webview,
+        last_pushed_json: String::new(),
+    })
+}
+
+/// Remove a window from the state map and destroy its GTK window.
+/// If no windows remain, exits the GTK main loop.
+fn remove_window(state: &mut RendererState, window_id: &str) -> Option<ManagedWindow> {
+    if let Some(managed) = state.windows.remove(window_id) {
+        // SAFETY: we have exclusive access to the window through our managed
+        // state; the window is not referenced elsewhere after this call.
+        unsafe { managed.gtk_window.destroy() };
+        if state.windows.is_empty() {
+            gtk::main_quit();
+        }
+        Some(managed)
+    } else {
+        None
+    }
+}
+
+/// Open all `initial_window_ids` windows and run the GTK main loop.
+///
+/// A single shared [`WebContext`] is used for all webviews — this gives one
+/// WebKit network process for all windows and one `widgex://` protocol
+/// registration. A non-blocking [`UnixListener`] is polled every 16 ms so
+/// the daemon can open/close windows while the loop is running.
+pub fn run_renderer(
+    payload: &RendererPayload,
+    config_dir: impl AsRef<Path>,
+    sources: &[DataSource],
+    allow_shell: bool,
+    control_socket_path: &Path,
+    initial_window_ids: &[&str],
+) -> Result<()> {
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        // SAFETY: runs before GTK spawns any threads.
+        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
+    }
+
+    gtk::init().context("failed to initialize GTK")?;
+
+    let config_dir = config_dir.as_ref().to_path_buf();
+    let mut base = payload.clone();
+    inline_theme_css(&mut base, &config_dir);
+
+    // Start poll + listen threads.
+    let poll_rx = start_pollers(sources, config_dir.clone());
+    let listener_rx = start_listeners(sources, config_dir.clone());
+
+    // Seed listen snapshots (e.g. active Hyprland workspace).
+    let initial_listen: BTreeMap<String, SourceSnapshot> =
+        widgex_source::seed_listen_snapshots(sources)
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+
+    let state = Rc::new(RefCell::new(RendererState {
+        windows: BTreeMap::new(),
+        global_poll_snapshots: BTreeMap::new(),
+        global_listen_snapshots: initial_listen,
+        base_payload: base,
+        config_dir: config_dir.clone(),
+        allow_shell,
+    }));
+
+    // IDs of windows whose GTK windows were destroyed by the user (not by us).
+    let destroyed_ids: Rc<RefCell<BTreeSet<String>>> = Rc::new(RefCell::new(BTreeSet::new()));
+
+    // One shared WebContext → one WebKit network process for all windows.
+    let mut web_context = WebContext::new(None);
+
+    // Open initial windows.
+    for &id in initial_window_ids {
+        match add_window(id, &state.borrow(), &mut web_context, Rc::clone(&destroyed_ids)) {
+            Ok(managed) => {
+                state.borrow_mut().windows.insert(id.to_string(), managed);
+            }
+            Err(e) => eprintln!("widgex renderer: failed to open window {id:?}: {e}"),
+        }
+    }
+
+    // Non-blocking control socket.
+    // Remove a stale socket file if it exists so bind() succeeds.
+    let _ = std::fs::remove_file(control_socket_path);
+    let control_listener =
+        UnixListener::bind(control_socket_path).context("failed to bind renderer control socket")?;
+    control_listener
+        .set_nonblocking(true)
+        .context("failed to set control socket non-blocking")?;
+
+    // GTK tick: drain channels, poll control socket, push changed payloads.
+    let state_tick = Rc::clone(&state);
+    let destroyed_tick = Rc::clone(&destroyed_ids);
+    // web_context must outlive the webviews; move it into the tick so it is
+    // kept alive until the loop exits.
+    let mut web_context_cell = Some(web_context);
+    gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
+        // ── Drain destroyed-window notifications ──────────────────────────
+        {
+            let mut killed: Vec<String> = destroyed_tick.borrow().iter().cloned().collect();
+            destroyed_tick.borrow_mut().clear();
+            for id in killed.drain(..) {
+                let mut st = state_tick.borrow_mut();
+                st.windows.remove(&id);
+                if st.windows.is_empty() {
+                    drop(st);
+                    gtk::main_quit();
+                    return gtk::glib::ControlFlow::Break;
+                }
+            }
+        }
+
+        // ── Drain poll + listen channels ──────────────────────────────────
+        let mut dirty = false;
+        {
+            let mut st = state_tick.borrow_mut();
+            while let Ok(snapshot) = poll_rx.try_recv() {
+                st.global_poll_snapshots.insert(snapshot.id.clone(), snapshot);
+                dirty = true;
+            }
+            if drain_listener_snapshots(&listener_rx, &mut st.global_listen_snapshots) {
+                dirty = true;
+            }
+        }
+
+        // ── Poll control socket ───────────────────────────────────────────
+        loop {
+            match control_listener.accept() {
+                Ok((mut stream, _)) => {
+                    let response = handle_control_request(
+                        &mut stream,
+                        &state_tick,
+                        &destroyed_tick,
+                        web_context_cell.as_mut().expect("web_context always present"),
+                    );
+                    if let Some(resp) = response {
+                        let is_stop = !resp.ok && resp.message == "__stop__";
+                        if let Ok(line) = resp.to_json_line() {
+                            let _ = stream.write_all(line.as_bytes());
+                        }
+                        if is_stop {
+                            gtk::main_quit();
+                            return gtk::glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    eprintln!("widgex renderer control error: {e}");
+                    break;
+                }
+            }
+        }
+
+        // ── Push changed payloads to each window ─────────────────────────
+        if dirty {
+            let mut st = state_tick.borrow_mut();
+            let mut snapshots: Vec<SourceSnapshot> =
+                st.global_poll_snapshots.values().cloned().collect();
+            snapshots.extend(st.global_listen_snapshots.values().cloned());
+
+            // Clone base_payload to release the immutable borrow before the
+            // mutable windows iteration.
+            let base_payload = st.base_payload.clone();
+            let resolved = resolve_payload(&base_payload, &snapshots);
+            if let Ok(json) = serde_json::to_string(&resolved) {
+                for managed in st.windows.values_mut() {
+                    if json != managed.last_pushed_json {
+                        let _ = managed.webview.evaluate_script(&format!(
+                            "window.__widgexPush && window.__widgexPush({json})"
+                        ));
+                        managed.last_pushed_json = json.clone();
+                    }
+                }
+            }
+        }
+
+        gtk::glib::ControlFlow::Continue
+    });
+
+    gtk::main();
+
+    // Kill listener-thread children (same as run_widget_window).
+    #[cfg(unix)]
+    unsafe {
+        let my_pid = std::process::id() as libc::pid_t;
+        if libc::getpgid(0) == my_pid {
+            let saved = libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::killpg(my_pid, libc::SIGTERM);
+            libc::signal(libc::SIGTERM, saved);
+        }
+    }
+
+    Ok(())
+}
+
+/// Read one JSON line from `stream`, parse it as a [`RendererRequest`], and
+/// return the [`RendererResponse`] to write back.  Returns `None` on I/O or
+/// parse errors (the error is printed to stderr).
+///
+/// The stop sentinel uses `ok: false, message: "__stop__"` so the caller can
+/// distinguish a Stop request from an ordinary error response.
+fn handle_control_request(
+    stream: &mut std::os::unix::net::UnixStream,
+    state: &Rc<RefCell<RendererState>>,
+    destroyed_ids: &Rc<RefCell<BTreeSet<String>>>,
+    web_context: &mut WebContext,
+) -> Option<RendererResponse> {
+    let mut line = String::new();
+    if BufReader::new(&*stream).read_line(&mut line).is_err() || line.is_empty() {
+        return None;
+    }
+    let request = match RendererRequest::from_json_line(&line) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("widgex renderer: bad control request: {e}");
+            return Some(RendererResponse::error(format!("parse error: {e}")));
+        }
+    };
+
+    match request {
+        RendererRequest::Status => {
+            let st = state.borrow();
+            let open: Vec<String> = st.windows.keys().cloned().collect();
+            Some(
+                RendererResponse::ok("ok")
+                    .with_open_windows(open),
+            )
+        }
+        RendererRequest::Stop => {
+            // Signal the tick loop to call gtk::main_quit.
+            // We use a sentinel response value to communicate this.
+            Some(RendererResponse {
+                ok: false,
+                message: "__stop__".to_string(),
+                open_windows: Vec::new(),
+            })
+        }
+        RendererRequest::Open { window_id } => {
+            let st = state.borrow();
+            if st.windows.contains_key(&window_id) {
+                return Some(RendererResponse::ok(format!("window {window_id:?} already open")));
+            }
+            drop(st);
+            match add_window(
+                &window_id,
+                &state.borrow(),
+                web_context,
+                Rc::clone(destroyed_ids),
+            ) {
+                Ok(managed) => {
+                    state.borrow_mut().windows.insert(window_id.clone(), managed);
+                    Some(RendererResponse::ok(format!("opened {window_id:?}")))
+                }
+                Err(e) => Some(RendererResponse::error(format!(
+                    "failed to open {window_id:?}: {e}"
+                ))),
+            }
+        }
+        RendererRequest::Close { window_id } => {
+            let removed = remove_window(&mut state.borrow_mut(), &window_id);
+            // remove_window calls gtk_window.destroy(), which fires connect_destroy,
+            // which inserts into destroyed_ids. Pre-drain so the tick doesn't
+            // see the window as newly destroyed and double-quit.
+            destroyed_ids.borrow_mut().remove(&window_id);
+            if removed.is_some() {
+                Some(RendererResponse::ok(format!("closed {window_id:?}")))
+            } else {
+                Some(RendererResponse::error(format!(
+                    "window {window_id:?} not found"
+                )))
+            }
+        }
+    }
+}
+
+// ── End multi-window renderer ────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct WidgetEvent {
@@ -260,54 +717,165 @@ fn start_listeners(sources: &[DataSource], cwd: PathBuf) -> Receiver<SourceSnaps
     let (tx, rx) = mpsc::channel();
     for source in sources
         .iter()
-        .filter(|source| source.kind == SourceKind::Shell && source.mode == SourceMode::Listen)
+        .filter(|source| source.mode == SourceMode::Listen)
         .cloned()
     {
         let tx = tx.clone();
         let cwd = cwd.clone();
-        thread::spawn(move || {
-            loop {
-                let Some(command) = source.command.as_deref() else {
-                    return;
-                };
-                let mut child = match Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .current_dir(&cwd)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                {
-                    Ok(child) => child,
-                    Err(_) => return,
-                };
+        match source.kind {
+            SourceKind::Shell => {
+                thread::spawn(move || listen_shell_source(source, cwd, tx));
+            }
+            SourceKind::UnixSocket => {
+                thread::spawn(move || listen_unix_socket_source(source, cwd, tx));
+            }
+            _ => {}
+        }
+    }
+    rx
+}
 
-                let Some(stdout) = child.stdout.take() else {
-                    let _ = child.wait();
-                    return;
-                };
+fn listen_shell_source(source: DataSource, cwd: PathBuf, tx: mpsc::Sender<SourceSnapshot>) {
+    let effective_cwd: PathBuf = source.working_dir.clone().unwrap_or(cwd);
+    let mut fields_cache = BTreeMap::new();
+    loop {
+        let Some(command) = source.command.as_deref() else {
+            return;
+        };
+        let mut child = match Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&effective_cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("widgex listen shell failed for {}: {error}", source.id);
+                return;
+            }
+        };
 
-                for line in BufReader::new(stdout)
-                    .lines()
-                    .map_while(std::result::Result::ok)
-                {
-                    let mut snapshot = SourceSnapshot::new(&source.id);
-                    snapshot.fields = widgex_source::parse_shell_output(source.format, &line);
-                    if tx.send(snapshot).is_err() {
-                        let _ = child.kill();
-                        let _ = child.wait();
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.wait();
+            return;
+        };
+
+        for line in BufReader::new(stdout)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            if send_source_line(&source, &line, &mut fields_cache, &tx).is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+
+        let _ = child.wait();
+        thread::sleep(reconnect_interval(&source));
+    }
+}
+
+fn listen_unix_socket_source(source: DataSource, cwd: PathBuf, tx: mpsc::Sender<SourceSnapshot>) {
+    let mut fields_cache = BTreeMap::new();
+    loop {
+        let Some(path) = source.path.as_deref() else {
+            return;
+        };
+        let path = source_path(path, &cwd);
+        match UnixStream::connect(&path) {
+            Ok(stream) => {
+                let reader = BufReader::new(stream);
+                for line in reader.lines().map_while(std::result::Result::ok) {
+                    if send_source_line(&source, &line, &mut fields_cache, &tx).is_err() {
                         return;
                     }
                 }
-
-                let _ = child.wait();
-                thread::sleep(std::time::Duration::from_millis(
-                    source.interval_ms.unwrap_or(1000).max(100),
-                ));
             }
-        });
+            Err(error) => {
+                eprintln!(
+                    "widgex unix_socket listen failed for {} at {}: {error}",
+                    source.id,
+                    path.display()
+                );
+            }
+        }
+        thread::sleep(reconnect_interval(&source));
     }
-    rx
+}
+
+fn send_source_line(
+    source: &DataSource,
+    line: &str,
+    fields_cache: &mut BTreeMap<String, String>,
+    tx: &mpsc::Sender<SourceSnapshot>,
+) -> std::result::Result<(), mpsc::SendError<SourceSnapshot>> {
+    let fields = widgex_source::parse_source_output(source.format, line);
+    let mut snapshot = SourceSnapshot::new(&source.id);
+    if source.format == widgex_core::SourceFormat::HyprlandEvent {
+        fields_cache.extend(fields);
+        snapshot.fields = fields_cache.clone();
+    } else {
+        snapshot.fields = fields;
+    }
+    tx.send(snapshot)
+}
+
+fn reconnect_interval(source: &DataSource) -> Duration {
+    Duration::from_millis(source.interval_ms.unwrap_or(1000).max(100))
+}
+
+fn source_path(path: &str, cwd: &Path) -> PathBuf {
+    let expanded = expand_env_vars(path);
+    let path = PathBuf::from(expanded);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn expand_env_vars(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            output.push(ch);
+            continue;
+        }
+
+        if matches!(chars.peek(), Some('{')) {
+            chars.next();
+            let mut name = String::new();
+            for next in chars.by_ref() {
+                if next == '}' {
+                    break;
+                }
+                name.push(next);
+            }
+            output.push_str(&std::env::var(name).unwrap_or_default());
+            continue;
+        }
+
+        let mut name = String::new();
+        while let Some(next) = chars.peek().copied() {
+            if next == '_' || next.is_ascii_alphanumeric() {
+                chars.next();
+                name.push(next);
+            } else {
+                break;
+            }
+        }
+
+        if name.is_empty() {
+            output.push('$');
+        } else {
+            output.push_str(&std::env::var(name).unwrap_or_default());
+        }
+    }
+    output
 }
 
 /// Each poll-mode source gets its own background thread with its own interval,
@@ -338,10 +906,13 @@ fn start_pollers(sources: &[DataSource], cwd: PathBuf) -> Receiver<SourceSnapsho
 fn drain_listener_snapshots(
     rx: &Receiver<SourceSnapshot>,
     latest: &mut BTreeMap<String, SourceSnapshot>,
-) {
+) -> bool {
+    let mut received = false;
     while let Ok(snapshot) = rx.try_recv() {
         latest.insert(snapshot.id.clone(), snapshot);
+        received = true;
     }
+    received
 }
 
 /// Custom-protocol handler: serve the embedded renderer bundle.
@@ -479,9 +1050,11 @@ fn example_snapshots(sources: &[RendererSource]) -> Vec<SourceSnapshot> {
                     .with_field("percent", "84")
                     .with_field("level", "Normal")
                     .with_field("status", "Discharging"),
-                SourceKind::Cpu | SourceKind::Memory | SourceKind::Network | SourceKind::Shell => {
-                    snapshot
-                }
+                SourceKind::Cpu
+                | SourceKind::Memory
+                | SourceKind::Network
+                | SourceKind::Shell
+                | SourceKind::UnixSocket => snapshot,
             }
         })
         .collect()
@@ -507,7 +1080,9 @@ fn map_edge(edge: AnchorEdge) -> Edge {
 
 #[cfg(test)]
 mod tests {
-    use super::is_safe_relative_path;
+    use super::{is_safe_relative_path, start_listeners};
+    use std::{io::Write, os::unix::net::UnixListener, thread, time::Duration};
+    use widgex_core::{DataSource, SourceFormat, SourceKind, SourceMode};
 
     #[test]
     fn config_asset_paths_reject_traversal_and_absolute_paths() {
@@ -515,5 +1090,132 @@ mod tests {
         assert!(is_safe_relative_path("./spotify_cache/default.png"));
         assert!(!is_safe_relative_path("../secret"));
         assert!(!is_safe_relative_path("/etc/passwd"));
+    }
+
+    #[test]
+    fn unix_socket_listener_reads_hyprland_event_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("hypr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            writeln!(stream, "workspacev2>>3,chat").unwrap();
+        });
+        let sources = vec![DataSource {
+            id: "hypr_events".into(),
+            kind: SourceKind::UnixSocket,
+            mode: SourceMode::Listen,
+            format: SourceFormat::HyprlandEvent,
+            interval_ms: Some(100),
+            timeout_ms: None,
+            command: None,
+            path: Some(socket_path.to_string_lossy().into_owned()),
+            working_dir: None,
+        }];
+
+        let rx = start_listeners(&sources, dir.path().to_path_buf());
+        let snapshot = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(snapshot.id, "hypr_events");
+        assert_eq!(
+            snapshot.fields.get("event").map(String::as_str),
+            Some("workspacev2")
+        );
+        assert_eq!(
+            snapshot.fields.get("workspace_id").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            snapshot.fields.get("workspace_name").map(String::as_str),
+            Some("chat")
+        );
+    }
+
+    #[test]
+    fn unix_socket_listener_reconnects_after_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("events.sock");
+        let sources = vec![DataSource {
+            id: "hypr_events".into(),
+            kind: SourceKind::UnixSocket,
+            mode: SourceMode::Listen,
+            format: SourceFormat::HyprlandEvent,
+            interval_ms: Some(100),
+            timeout_ms: None,
+            command: None,
+            path: Some(socket_path.to_string_lossy().into_owned()),
+            working_dir: None,
+        }];
+
+        let first_listener = UnixListener::bind(&socket_path).unwrap();
+        let first_server = thread::spawn(move || {
+            let (mut stream, _) = first_listener.accept().unwrap();
+            writeln!(stream, "workspacev2>>1,main").unwrap();
+        });
+        let rx = start_listeners(&sources, dir.path().to_path_buf());
+        let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        first_server.join().unwrap();
+        std::fs::remove_file(&socket_path).unwrap();
+
+        let second_listener = UnixListener::bind(&socket_path).unwrap();
+        let second_server = thread::spawn(move || {
+            let (mut stream, _) = second_listener.accept().unwrap();
+            writeln!(stream, "workspacev2>>2,web").unwrap();
+        });
+        let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        second_server.join().unwrap();
+
+        assert_eq!(
+            first.fields.get("workspace_name").map(String::as_str),
+            Some("main")
+        );
+        assert_eq!(
+            second.fields.get("workspace_name").map(String::as_str),
+            Some("web")
+        );
+    }
+
+    #[test]
+    fn hyprland_event_listener_keeps_workspace_state_across_other_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("hypr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            writeln!(stream, "workspacev2>>4,music").unwrap();
+            writeln!(stream, "activewindowv2>>0xabc").unwrap();
+        });
+        let sources = vec![DataSource {
+            id: "hypr_events".into(),
+            kind: SourceKind::UnixSocket,
+            mode: SourceMode::Listen,
+            format: SourceFormat::HyprlandEvent,
+            interval_ms: Some(100),
+            timeout_ms: None,
+            command: None,
+            path: Some(socket_path.to_string_lossy().into_owned()),
+            working_dir: None,
+        }];
+
+        let rx = start_listeners(&sources, dir.path().to_path_buf());
+        let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            first.fields.get("workspace4_style").map(String::as_str),
+            second.fields.get("workspace4_style").map(String::as_str)
+        );
+        assert!(
+            second
+                .fields
+                .get("workspace4_style")
+                .is_some_and(|style| style.contains("background: var(--ctp-green)"))
+        );
+        assert_eq!(
+            second.fields.get("window_address").map(String::as_str),
+            Some("0xabc")
+        );
     }
 }
