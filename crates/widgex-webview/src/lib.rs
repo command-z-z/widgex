@@ -389,21 +389,6 @@ fn add_window(
     })
 }
 
-/// Remove a window from the state map and destroy its GTK window.
-/// If no windows remain, exits the GTK main loop.
-fn remove_window(state: &mut RendererState, window_id: &str) -> Option<ManagedWindow> {
-    if let Some(managed) = state.windows.remove(window_id) {
-        // SAFETY: we have exclusive access to the window through our managed
-        // state; the window is not referenced elsewhere after this call.
-        unsafe { managed.gtk_window.destroy() };
-        if state.windows.is_empty() {
-            gtk::main_quit();
-        }
-        Some(managed)
-    } else {
-        None
-    }
-}
 
 /// Open all `initial_window_ids` windows and run the GTK main loop.
 ///
@@ -466,6 +451,10 @@ pub fn run_renderer(
         }
     }
 
+    if state.borrow().windows.is_empty() {
+        return Err(anyhow!("no windows were opened; check window IDs and config"));
+    }
+
     // Non-blocking control socket.
     // Remove a stale socket file if it exists so bind() succeeds.
     let _ = std::fs::remove_file(control_socket_path);
@@ -478,9 +467,9 @@ pub fn run_renderer(
     // GTK tick: drain channels, poll control socket, push changed payloads.
     let state_tick = Rc::clone(&state);
     let destroyed_tick = Rc::clone(&destroyed_ids);
-    // web_context must outlive the webviews; move it into the tick so it is
-    // kept alive until the loop exits.
-    let mut web_context_cell = Some(web_context);
+    // web_context must outlive the webviews; move it into the tick closure so
+    // it is kept alive until the loop exits.
+    let mut web_context = web_context;
     gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
         // ── Drain destroyed-window notifications ──────────────────────────
         {
@@ -518,14 +507,13 @@ pub fn run_renderer(
                         &mut stream,
                         &state_tick,
                         &destroyed_tick,
-                        web_context_cell.as_mut().expect("web_context always present"),
+                        &mut web_context,
                     );
-                    if let Some(resp) = response {
-                        let is_stop = !resp.ok && resp.message == "__stop__";
+                    if let Some((resp, stop)) = response {
                         if let Ok(line) = resp.to_json_line() {
                             let _ = stream.write_all(line.as_bytes());
                         }
-                        if is_stop {
+                        if stop {
                             gtk::main_quit();
                             return gtk::glib::ControlFlow::Break;
                         }
@@ -582,17 +570,15 @@ pub fn run_renderer(
 }
 
 /// Read one JSON line from `stream`, parse it as a [`RendererRequest`], and
-/// return the [`RendererResponse`] to write back.  Returns `None` on I/O or
-/// parse errors (the error is printed to stderr).
-///
-/// The stop sentinel uses `ok: false, message: "__stop__"` so the caller can
-/// distinguish a Stop request from an ordinary error response.
+/// return the [`RendererResponse`] plus a `bool` indicating whether the caller
+/// should call `gtk::main_quit()`. Returns `None` on I/O or parse errors (the
+/// error is printed to stderr).
 fn handle_control_request(
     stream: &mut std::os::unix::net::UnixStream,
     state: &Rc<RefCell<RendererState>>,
     destroyed_ids: &Rc<RefCell<BTreeSet<String>>>,
     web_context: &mut WebContext,
-) -> Option<RendererResponse> {
+) -> Option<(RendererResponse, bool)> {
     let mut line = String::new();
     if BufReader::new(&*stream).read_line(&mut line).is_err() || line.is_empty() {
         return None;
@@ -601,7 +587,7 @@ fn handle_control_request(
         Ok(r) => r,
         Err(e) => {
             eprintln!("widgex renderer: bad control request: {e}");
-            return Some(RendererResponse::error(format!("parse error: {e}")));
+            return Some((RendererResponse::error(format!("parse error: {e}")), false));
         }
     };
 
@@ -609,24 +595,22 @@ fn handle_control_request(
         RendererRequest::Status => {
             let st = state.borrow();
             let open: Vec<String> = st.windows.keys().cloned().collect();
-            Some(
-                RendererResponse::ok("ok")
-                    .with_open_windows(open),
-            )
+            Some((
+                RendererResponse::ok("ok").with_open_windows(open),
+                false,
+            ))
         }
         RendererRequest::Stop => {
-            // Signal the tick loop to call gtk::main_quit.
-            // We use a sentinel response value to communicate this.
-            Some(RendererResponse {
-                ok: false,
-                message: "__stop__".to_string(),
-                open_windows: Vec::new(),
-            })
+            // Signal the tick loop to call gtk::main_quit via the bool flag.
+            Some((RendererResponse::ok("stopping"), true))
         }
         RendererRequest::Open { window_id } => {
             let st = state.borrow();
             if st.windows.contains_key(&window_id) {
-                return Some(RendererResponse::ok(format!("window {window_id:?} already open")));
+                return Some((
+                    RendererResponse::ok(format!("window {window_id:?} already open")),
+                    false,
+                ));
             }
             drop(st);
             match add_window(
@@ -637,25 +621,43 @@ fn handle_control_request(
             ) {
                 Ok(managed) => {
                     state.borrow_mut().windows.insert(window_id.clone(), managed);
-                    Some(RendererResponse::ok(format!("opened {window_id:?}")))
+                    Some((RendererResponse::ok(format!("opened {window_id:?}")), false))
                 }
-                Err(e) => Some(RendererResponse::error(format!(
-                    "failed to open {window_id:?}: {e}"
-                ))),
+                Err(e) => Some((
+                    RendererResponse::error(format!("failed to open {window_id:?}: {e}")),
+                    false,
+                )),
             }
         }
         RendererRequest::Close { window_id } => {
-            let removed = remove_window(&mut state.borrow_mut(), &window_id);
-            // remove_window calls gtk_window.destroy(), which fires connect_destroy,
-            // which inserts into destroyed_ids. Pre-drain so the tick doesn't
-            // see the window as newly destroyed and double-quit.
-            destroyed_ids.borrow_mut().remove(&window_id);
-            if removed.is_some() {
-                Some(RendererResponse::ok(format!("closed {window_id:?}")))
+            // Borrow safety: we extract the ManagedWindow from state while
+            // holding borrow_mut, then DROP the guard before calling
+            // gtk_window.destroy(). This ensures that if the connect_destroy
+            // callback (which borrows destroyed_ids) somehow also touched
+            // state, there would be no active mutable borrow of state at that
+            // point. destroyed_ids is a separate RefCell so is not affected.
+            let extracted = state.borrow_mut().windows.remove(&window_id);
+            // `state` borrow_mut guard is dropped here — before destroy().
+            if let Some(managed) = extracted {
+                let will_be_empty = state.borrow().windows.is_empty();
+                // destroy() fires connect_destroy callbacks synchronously.
+                // No borrow_mut on state or destroyed_ids is held at this point.
+                // SAFETY: we have exclusive ownership of this window; it is no
+                // longer referenced by any other part of the program after
+                // removal from state.windows above.
+                unsafe { managed.gtk_window.destroy() };
+                // The connect_destroy callback may have inserted window_id into
+                // destroyed_ids. Remove it so the tick loop skips it.
+                destroyed_ids.borrow_mut().remove(&window_id);
+                if will_be_empty {
+                    gtk::main_quit();
+                }
+                Some((RendererResponse::ok(format!("closed {window_id:?}")), false))
             } else {
-                Some(RendererResponse::error(format!(
-                    "window {window_id:?} not found"
-                )))
+                Some((
+                    RendererResponse::error(format!("window {window_id:?} not found")),
+                    false,
+                ))
             }
         }
     }
