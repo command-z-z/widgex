@@ -215,34 +215,33 @@ fn run_cli(cli: Cli) -> Result<CliOutput> {
             }
         }
         Command::Renderer {
+            foreground,
             config,
             socket,
             window,
-            ..
         } => {
+            if !foreground {
+                return Err(anyhow!("renderer subcommand must be run with --foreground"));
+            }
             let config_path = config.unwrap_or_else(default_config_path);
             let config = load_validated_config(&config_path)
-                .map_err(|diags| anyhow::anyhow!(diagnostics_to_string(&diags)))?;
+                .map_err(|diags| anyhow!(diagnostics_to_string(&diags)))?;
             let payload = renderer_payload_from_config(&config)
-                .map_err(|diags| anyhow::anyhow!(diagnostics_to_string(&diags)))?;
+                .map_err(|diags| anyhow!(diagnostics_to_string(&diags)))?;
             let config_dir = config_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
-            let sources = config.sources.clone();
             let allow_shell = config.permissions.allow_shell;
-
-            // If --window not specified, open all windows from config
             let window_ids: Vec<&str> = if window.is_empty() {
                 payload.windows.iter().map(|w| w.id.as_str()).collect()
             } else {
                 window.iter().map(String::as_str).collect()
             };
-
             widgex_webview::run_renderer(
                 &payload,
                 &config_dir,
-                &sources,
+                &config.sources,
                 allow_shell,
                 &socket,
                 &window_ids,
