@@ -473,9 +473,8 @@ pub fn run_renderer(
     gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
         // ── Drain destroyed-window notifications ──────────────────────────
         {
-            let mut killed: Vec<String> = destroyed_tick.borrow().iter().cloned().collect();
-            destroyed_tick.borrow_mut().clear();
-            for id in killed.drain(..) {
+            let killed = std::mem::take(&mut *destroyed_tick.borrow_mut());
+            for id in killed {
                 let mut st = state_tick.borrow_mut();
                 st.windows.remove(&id);
                 if st.windows.is_empty() {
