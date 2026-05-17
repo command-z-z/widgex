@@ -324,8 +324,16 @@ impl WidgetProcessManager {
             }
         }
 
+        // Timed out — kill the orphaned renderer process group before returning.
+        if let Some(mut child) = self.renderer_child.take() {
+            let pid = child.id() as i32;
+            unsafe { libc::killpg(pid, libc::SIGTERM) };
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_file(&self.renderer_socket);
+
         Err(anyhow!(
-            "renderer socket {} not ready after 2 seconds",
+            "renderer socket {} did not appear within 2 seconds",
             self.renderer_socket.display()
         ))
     }
@@ -350,13 +358,13 @@ impl WidgetProcessManager {
     }
 
     pub fn reap_finished(&mut self) {
-        let finished = self
-            .renderer_child
-            .as_mut()
-            .and_then(|c| c.try_wait().ok())
-            .is_some_and(|status| status.is_some());
+        let gone = match self.renderer_child.as_mut().map(|c| c.try_wait()) {
+            None => false,
+            Some(Ok(None)) => false,               // still running
+            Some(Ok(Some(_))) | Some(Err(_)) => true, // exited or error → treat as gone
+        };
 
-        if finished {
+        if gone {
             self.renderer_child = None;
             self.open_windows.clear();
         }
@@ -368,10 +376,27 @@ impl WidgetProcessManager {
     }
 
     /// Wait for the renderer child to exit (called when open_windows becomes empty).
+    /// Sends SIGTERM, polls for up to 500 ms, then force-kills with SIGKILL.
     fn wait_for_renderer_exit(&mut self) {
-        if let Some(mut child) = self.renderer_child.take() {
-            let _ = child.wait();
+        let Some(ref mut child) = self.renderer_child else { return };
+        let pid = child.id() as i32;
+        unsafe { libc::killpg(pid, libc::SIGTERM) };
+        for _ in 0..5 {
+            thread::sleep(Duration::from_millis(100));
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    self.renderer_child = None;
+                    self.open_windows.clear();
+                    return;
+                }
+                Ok(None) => {}
+            }
         }
+        // Force kill if still alive after 500 ms.
+        unsafe { libc::killpg(pid, libc::SIGKILL) };
+        let _ = self.renderer_child.as_mut().map(|c| c.wait());
+        self.renderer_child = None;
+        self.open_windows.clear();
     }
 
     fn open_window_ids(&self) -> Vec<String> {
