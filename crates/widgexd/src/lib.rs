@@ -1,19 +1,21 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
+    os::unix::io::AsRawFd,
     os::unix::net::{UnixListener, UnixStream},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
-    time::SystemTime,
+    thread,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use widgex_core::{Config, diagnostics_to_string, load_validated_config};
-use widgex_ipc::{DaemonRequest, DaemonResponse};
+use widgex_ipc::{DaemonRequest, DaemonResponse, RendererRequest, send_renderer_request};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonCommand {
@@ -56,7 +58,9 @@ pub struct WidgetProcessTable {
 pub struct WidgetProcessManager {
     config_path: PathBuf,
     cli_path: PathBuf,
-    children: std::collections::BTreeMap<String, Child>,
+    renderer_child: Option<Child>,
+    renderer_socket: PathBuf,
+    open_windows: BTreeSet<String>,
 }
 
 impl Default for DaemonState {
@@ -173,17 +177,21 @@ impl WidgetProcessTable {
 }
 
 impl WidgetProcessManager {
-    pub fn new(config_path: impl Into<PathBuf>, cli_path: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        config_path: impl Into<PathBuf>,
+        cli_path: impl Into<PathBuf>,
+        renderer_socket: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             config_path: config_path.into(),
             cli_path: cli_path.into(),
-            children: std::collections::BTreeMap::new(),
+            renderer_child: None,
+            renderer_socket: renderer_socket.into(),
+            open_windows: BTreeSet::new(),
         }
     }
 
     pub fn handle_request(&mut self, request: DaemonRequest) -> DaemonResponse {
-        self.reap_finished();
-
         self.handle_request_result(request)
             .unwrap_or_else(|error| DaemonResponse::error(error.to_string()))
     }
@@ -191,6 +199,7 @@ impl WidgetProcessManager {
     fn handle_request_result(&mut self, request: DaemonRequest) -> Result<DaemonResponse> {
         match request {
             DaemonRequest::Status => {
+                self.reap_finished();
                 Ok(DaemonResponse::ok("daemon running").with_open_windows(self.open_window_ids()))
             }
             DaemonRequest::Stop => {
@@ -200,23 +209,50 @@ impl WidgetProcessManager {
             DaemonRequest::Open { window_id, toggle } => {
                 let window_id = self.resolve_window_id(window_id.as_deref())?;
 
-                if toggle && self.children.contains_key(&window_id) {
-                    self.stop_window(&window_id)?;
+                if toggle && self.open_windows.contains(&window_id) {
+                    // Toggle close: send Close to renderer, remove from open set
+                    let _ = send_renderer_request(
+                        &self.renderer_socket,
+                        &RendererRequest::Close { window_id: window_id.clone() },
+                    );
+                    self.open_windows.remove(&window_id);
+                    if self.open_windows.is_empty() {
+                        self.wait_for_renderer_exit();
+                    }
                     Ok(DaemonResponse::ok(format!("closed {window_id}"))
                         .with_open_windows(self.open_window_ids()))
-                } else if self.children.contains_key(&window_id) {
+                } else if self.open_windows.contains(&window_id) {
                     Ok(DaemonResponse::ok(format!("{window_id} already open"))
                         .with_open_windows(self.open_window_ids()))
+                } else if !self.renderer_running() {
+                    // No renderer yet — spawn one with this window as initial window
+                    self.spawn_renderer(&[window_id.clone()])?;
+                    self.open_windows.insert(window_id.clone());
+                    Ok(DaemonResponse::ok(format!("opened {window_id}"))
+                        .with_open_windows(self.open_window_ids()))
                 } else {
-                    self.spawn_window(&window_id)?;
+                    // Renderer already running — ask it to open another window
+                    send_renderer_request(
+                        &self.renderer_socket,
+                        &RendererRequest::Open { window_id: window_id.clone() },
+                    )
+                    .with_context(|| format!("failed to open window {window_id} in renderer"))?;
+                    self.open_windows.insert(window_id.clone());
                     Ok(DaemonResponse::ok(format!("opened {window_id}"))
                         .with_open_windows(self.open_window_ids()))
                 }
             }
             DaemonRequest::Close { window_id } => {
                 let window_id = self.resolve_window_id(window_id.as_deref())?;
-                if self.children.contains_key(&window_id) {
-                    self.stop_window(&window_id)?;
+                if self.open_windows.contains(&window_id) {
+                    let _ = send_renderer_request(
+                        &self.renderer_socket,
+                        &RendererRequest::Close { window_id: window_id.clone() },
+                    );
+                    self.open_windows.remove(&window_id);
+                    if self.open_windows.is_empty() {
+                        self.wait_for_renderer_exit();
+                    }
                     Ok(DaemonResponse::ok(format!("closed {window_id}"))
                         .with_open_windows(self.open_window_ids()))
                 } else {
@@ -247,57 +283,99 @@ impl WidgetProcessManager {
         }
     }
 
-    fn spawn_window(&mut self, window_id: &str) -> Result<()> {
-        let child = ProcessCommand::new(&self.cli_path)
-            .arg("open")
+    fn spawn_renderer(&mut self, initial_window_ids: &[String]) -> Result<()> {
+        // Remove stale renderer socket file if it exists (same pattern as
+        // remove_stale_socket in run_socket_daemon, but best-effort here since
+        // the renderer creates its own socket).
+        if self.renderer_socket.exists() {
+            let _ = fs::remove_file(&self.renderer_socket);
+        }
+
+        let mut cmd = ProcessCommand::new(&self.cli_path);
+        cmd.arg("renderer")
             .arg("--foreground")
             .arg("--config")
             .arg(&self.config_path)
-            .arg(window_id)
+            .arg("--socket")
+            .arg(&self.renderer_socket);
+
+        for id in initial_window_ids {
+            cmd.arg("--window").arg(id);
+        }
+
+        let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            // Put each widget and its shell listeners in their own process
-            // group so closing a window also reaps playerctl -F/metadata.py.
+            // Put the renderer and all its descendant processes in their own
+            // process group so that killing the group closes everything cleanly.
             .process_group(0)
             .spawn()
-            .with_context(|| format!("failed to spawn {}", self.cli_path.display()))?;
+            .with_context(|| format!("failed to spawn renderer {}", self.cli_path.display()))?;
 
-        self.children.insert(window_id.to_string(), child);
-        Ok(())
+        self.renderer_child = Some(child);
+
+        // Poll for socket readiness: try UnixStream::connect every 50 ms up to
+        // 40 times (2 seconds total).
+        for _ in 0..40 {
+            thread::sleep(Duration::from_millis(50));
+            if UnixStream::connect(&self.renderer_socket).is_ok() {
+                return Ok(());
+            }
+        }
+
+        Err(anyhow!(
+            "renderer socket {} not ready after 2 seconds",
+            self.renderer_socket.display()
+        ))
     }
 
-    fn stop_window(&mut self, window_id: &str) -> Result<()> {
-        if let Some(mut child) = self.children.remove(window_id) {
+    pub fn stop_all(&mut self) {
+        // Ask the renderer to stop gracefully (best-effort).
+        let _ = send_renderer_request(&self.renderer_socket, &RendererRequest::Stop);
+
+        // Kill the renderer process group unconditionally.
+        if let Some(ref child) = self.renderer_child {
             let pid = child.id() as i32;
-            // SAFETY: `pid` is the child process group id because spawn_window
-            // uses process_group(0). Fall back to killing the child if killpg
-            // fails, e.g. if it already exited.
-            if unsafe { libc::killpg(pid, libc::SIGTERM) } != 0 {
-                let _ = child.kill();
-            }
+            // SAFETY: pid is the renderer's process group id because
+            // spawn_renderer uses process_group(0).
+            unsafe { libc::killpg(pid, libc::SIGTERM) };
+        }
+
+        if let Some(mut child) = self.renderer_child.take() {
             let _ = child.wait();
         }
-        Ok(())
+
+        self.open_windows.clear();
     }
 
-    fn stop_all(&mut self) {
-        let window_ids = self.children.keys().cloned().collect::<Vec<_>>();
-        for window_id in window_ids {
-            let _ = self.stop_window(&window_id);
+    pub fn reap_finished(&mut self) {
+        let finished = self
+            .renderer_child
+            .as_mut()
+            .and_then(|c| c.try_wait().ok())
+            .is_some_and(|status| status.is_some());
+
+        if finished {
+            self.renderer_child = None;
+            self.open_windows.clear();
         }
     }
 
-    fn reap_finished(&mut self) {
-        self.children.retain(|_, child| match child.try_wait() {
-            Ok(Some(_)) => false,
-            Ok(None) => true,
-            Err(_) => false,
-        });
+    fn renderer_running(&mut self) -> bool {
+        self.reap_finished();
+        self.renderer_child.is_some()
+    }
+
+    /// Wait for the renderer child to exit (called when open_windows becomes empty).
+    fn wait_for_renderer_exit(&mut self) {
+        if let Some(mut child) = self.renderer_child.take() {
+            let _ = child.wait();
+        }
     }
 
     fn open_window_ids(&self) -> Vec<String> {
-        self.children.keys().cloned().collect()
+        self.open_windows.iter().cloned().collect()
     }
 }
 
@@ -321,25 +399,57 @@ pub fn run_socket_daemon(
     remove_stale_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
-    let mut manager = WidgetProcessManager::new(config_path, cli_path);
+    let renderer_socket = socket_path.with_file_name("widgex-renderer.sock");
+    let mut manager = WidgetProcessManager::new(config_path, cli_path, renderer_socket);
 
-    for stream in listener.incoming() {
-        let mut stream = stream.context("failed to accept daemon connection")?;
-        let request = read_request(&stream)?;
-        let should_stop = matches!(request, DaemonRequest::Stop);
-        let response = manager.handle_request(request);
-        stream
-            .write_all(response.to_json_line()?.as_bytes())
-            .context("failed to write daemon response")?;
-
-        if should_stop {
-            break;
+    loop {
+        match accept_timeout(&listener, Duration::from_secs(1)) {
+            Ok(None) => {
+                // Timeout: reap any finished widget processes so they don't sit as
+                // zombies between IPC requests.
+                manager.reap_finished();
+            }
+            Ok(Some(mut stream)) => {
+                let request = read_request(&stream)?;
+                let should_stop = matches!(request, DaemonRequest::Stop);
+                let response = manager.handle_request(request);
+                stream
+                    .write_all(response.to_json_line()?.as_bytes())
+                    .context("failed to write daemon response")?;
+                if should_stop {
+                    break;
+                }
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 
     manager.stop_all();
     let _ = fs::remove_file(&socket_path);
     Ok(())
+}
+
+/// Block until the listener has an incoming connection or `timeout` elapses.
+/// Returns `Ok(None)` on timeout, `Ok(Some(stream))` on connection, `Err` on error.
+fn accept_timeout(listener: &UnixListener, timeout: Duration) -> io::Result<Option<UnixStream>> {
+    let mut pfd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    let n = unsafe { libc::poll(std::ptr::addr_of_mut!(pfd), 1, timeout_ms) };
+    match n {
+        -1 => {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(None);
+            }
+            Err(err)
+        }
+        0 => Ok(None),
+        _ => listener.accept().map(|(stream, _)| Some(stream)),
+    }
 }
 
 fn read_request(stream: &UnixStream) -> Result<DaemonRequest> {
