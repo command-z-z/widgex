@@ -60,6 +60,16 @@ enum Command {
         toggle: bool,
         window: Option<String>,
     },
+    Renderer {
+        #[arg(long)]
+        foreground: bool,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long = "window")]
+        window: Vec<String>,
+    },
     Schema,
     Doctor,
     Daemon {
@@ -203,6 +213,41 @@ fn run_cli(cli: Cli) -> Result<CliOutput> {
                 )?;
                 Ok(CliOutput::Message("widget window closed".to_string()))
             }
+        }
+        Command::Renderer {
+            config,
+            socket,
+            window,
+            ..
+        } => {
+            let config_path = config.unwrap_or_else(default_config_path);
+            let config = load_validated_config(&config_path)
+                .map_err(|diags| anyhow::anyhow!(diagnostics_to_string(&diags)))?;
+            let payload = renderer_payload_from_config(&config)
+                .map_err(|diags| anyhow::anyhow!(diagnostics_to_string(&diags)))?;
+            let config_dir = config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            let sources = config.sources.clone();
+            let allow_shell = config.permissions.allow_shell;
+
+            // If --window not specified, open all windows from config
+            let window_ids: Vec<&str> = if window.is_empty() {
+                payload.windows.iter().map(|w| w.id.as_str()).collect()
+            } else {
+                window.iter().map(String::as_str).collect()
+            };
+
+            widgex_webview::run_renderer(
+                &payload,
+                &config_dir,
+                &sources,
+                allow_shell,
+                &socket,
+                &window_ids,
+            )?;
+            Ok(CliOutput::Message(String::new()))
         }
         Command::Schema => Ok(CliOutput::Json(schema_json_pretty::<Config>()?)),
         Command::Doctor => Ok(CliOutput::Message(doctor_report())),
