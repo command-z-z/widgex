@@ -62,6 +62,7 @@ const SUPPORTED_WIDGETS = new Set([
   "progress",
   "spacer",
   "animation",
+  "canvas",
 ]);
 
 export function normalizeWidgetTree(

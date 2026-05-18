@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, onCleanup } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, onMount } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import type {
   NormalizedWidgetNode,
@@ -221,6 +221,222 @@ function AnimationWidget(props: { widget: NormalizedWidgetNode }) {
   );
 }
 
+// --- Canvas particle engine ---
+
+interface ParticleParams {
+  mode: "snow" | "leaves" | "stars";
+  count: number;
+  speed: number;
+  alpha: number;
+  wind: number;
+}
+
+function tryParseParams(value?: string): ParticleParams {
+  const defaults: ParticleParams = { mode: "snow", count: 120, speed: 1.0, alpha: 0.85, wind: 0.2 };
+  if (!value) return defaults;
+  try {
+    return { ...defaults, ...JSON.parse(value) };
+  } catch {
+    return defaults;
+  }
+}
+
+interface Particle {
+  x: number; y: number; r: number; vx: number; vy: number;
+  alpha: number; alphaDelta: number;
+  // leaves
+  rotation?: number; rotationSpeed?: number; w?: number; h?: number; color?: string;
+  // stars: shooting star fields
+  isShooting?: boolean; length?: number; age?: number; maxAge?: number;
+}
+
+const LEAF_COLORS = ["#c45c13", "#d4750a", "#b8860b", "#8b6914", "#c47a1d", "#9b3a00"];
+
+function createParticleEngine(canvas: HTMLCanvasElement, params: ParticleParams) {
+  const { mode, count, speed, alpha: baseAlpha, wind } = params;
+  const W = () => canvas.width;
+  const H = () => canvas.height;
+
+  const particles: Particle[] = [];
+
+  function spawnSnow(p: Particle) {
+    p.x = Math.random() * W();
+    p.y = Math.random() * H();
+    p.r = 2 + Math.random() * 4;
+    p.vx = (Math.random() - 0.5) * wind * 2;
+    p.vy = (0.4 + Math.random() * 0.8) * speed;
+    p.alpha = 0.5 + Math.random() * 0.5;
+    p.alphaDelta = 0;
+  }
+
+  function spawnLeaf(p: Particle) {
+    p.x = Math.random() * W();
+    p.y = -20 + Math.random() * 40 - 40;
+    p.w = 8 + Math.random() * 8;
+    p.h = 4 + Math.random() * 6;
+    p.vx = (Math.random() - 0.5) * wind * 4 + (Math.random() > 0.5 ? 0.3 : -0.3);
+    p.vy = (0.5 + Math.random() * 1.2) * speed;
+    p.rotation = Math.random() * Math.PI * 2;
+    p.rotationSpeed = (Math.random() - 0.5) * 0.05;
+    p.color = LEAF_COLORS[Math.floor(Math.random() * LEAF_COLORS.length)];
+    p.alpha = 0.6 + Math.random() * 0.4;
+    p.alphaDelta = 0;
+    p.r = 0;
+  }
+
+  function spawnStar(p: Particle) {
+    p.x = Math.random() * W();
+    p.y = Math.random() * H();
+    p.r = Math.random() < 0.15 ? 2 : 1;
+    p.vx = 0; p.vy = 0;
+    p.alpha = 0.3 + Math.random() * 0.7;
+    p.alphaDelta = (Math.random() - 0.5) * 0.008;
+    p.isShooting = false;
+  }
+
+  function spawnShooting(p: Particle) {
+    p.x = Math.random() * W();
+    p.y = Math.random() * (H() * 0.5);
+    p.vx = 4 + Math.random() * 6;
+    p.vy = 2 + Math.random() * 4;
+    p.length = 40 + Math.random() * 80;
+    p.alpha = 1;
+    p.alphaDelta = -0.03;
+    p.age = 0;
+    p.maxAge = 30 + Math.floor(Math.random() * 20);
+    p.isShooting = true;
+    p.r = 0;
+  }
+
+  const spawn = mode === "snow" ? spawnSnow : mode === "leaves" ? spawnLeaf : spawnStar;
+  for (let i = 0; i < count; i++) {
+    const p: Particle = { x: 0, y: 0, r: 0, vx: 0, vy: 0, alpha: 0, alphaDelta: 0 };
+    spawn(p);
+    if (mode === "snow") p.y = Math.random() * H(); // scatter vertically at start
+    particles.push(p);
+  }
+
+  // A few shooting stars pre-allocated
+  const shooters: Particle[] = [];
+  if (mode === "stars") {
+    for (let i = 0; i < 3; i++) {
+      const p: Particle = { x: 0, y: 0, r: 0, vx: 0, vy: 0, alpha: 0, alphaDelta: 0 };
+      spawnShooting(p);
+      p.age = p.maxAge; // start as "done" so they don't all fire at once
+      shooters.push(p);
+    }
+  }
+
+  return {
+    tick() {
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.clearRect(0, 0, W(), H());
+
+      if (mode === "snow") {
+        for (const p of particles) {
+          p.x += p.vx + Math.sin(Date.now() / 2000 + p.y * 0.02) * 0.3 * wind;
+          p.y += p.vy;
+          if (p.y > H() + p.r) { spawnSnow(p); p.y = -p.r; }
+          if (p.x < -p.r) p.x = W() + p.r;
+          if (p.x > W() + p.r) p.x = -p.r;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(255,255,255,${(p.alpha * baseAlpha).toFixed(2)})`;
+          ctx.fill();
+        }
+      } else if (mode === "leaves") {
+        for (const p of particles) {
+          p.x += p.vx + Math.sin(Date.now() / 1500 + p.y * 0.01) * wind;
+          p.y += p.vy;
+          p.rotation! += p.rotationSpeed!;
+          if (p.y > H() + 20) spawnLeaf(p);
+          ctx.save();
+          ctx.translate(p.x, p.y);
+          ctx.rotate(p.rotation!);
+          ctx.globalAlpha = p.alpha * baseAlpha;
+          ctx.fillStyle = p.color!;
+          ctx.beginPath();
+          ctx.ellipse(0, 0, p.w! / 2, p.h! / 2, 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+          ctx.globalAlpha = 1;
+        }
+      } else {
+        // stars
+        for (const p of particles) {
+          p.alpha += p.alphaDelta;
+          if (p.alpha > 1) { p.alpha = 1; p.alphaDelta = -Math.abs(p.alphaDelta); }
+          if (p.alpha < 0.1) { p.alpha = 0.1; p.alphaDelta = Math.abs(p.alphaDelta); }
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(255,255,255,${(p.alpha * baseAlpha).toFixed(2)})`;
+          ctx.fill();
+        }
+        // shooting stars
+        for (const p of shooters) {
+          p.age = (p.age ?? 0) + 1;
+          if (p.age >= p.maxAge!) {
+            // random re-trigger: ~2% chance per frame once expired
+            if (Math.random() < 0.005) spawnShooting(p);
+            continue;
+          }
+          p.x += p.vx!;
+          p.y += p.vy!;
+          p.alpha += p.alphaDelta;
+          if (p.alpha < 0) p.alpha = 0;
+          const dx = -(p.vx! / Math.hypot(p.vx!, p.vy!)) * p.length!;
+          const dy = -(p.vy! / Math.hypot(p.vx!, p.vy!)) * p.length!;
+          const grad = ctx.createLinearGradient(p.x, p.y, p.x + dx, p.y + dy);
+          grad.addColorStop(0, `rgba(255,255,255,${p.alpha.toFixed(2)})`);
+          grad.addColorStop(1, "rgba(255,255,255,0)");
+          ctx.beginPath();
+          ctx.moveTo(p.x, p.y);
+          ctx.lineTo(p.x + dx, p.y + dy);
+          ctx.strokeStyle = grad;
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        }
+      }
+    },
+  };
+}
+
+function CanvasWidget(props: { widget: NormalizedWidgetNode }) {
+  let canvasRef!: HTMLCanvasElement;
+
+  onMount(() => {
+    const params = tryParseParams(props.widget.value);
+
+    const resize = () => {
+      canvasRef.width = canvasRef.offsetWidth || window.innerWidth;
+      canvasRef.height = canvasRef.offsetHeight || window.innerHeight;
+    };
+    resize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(canvasRef);
+
+    const engine = createParticleEngine(canvasRef, params);
+    let rafId = requestAnimationFrame(function loop() {
+      engine.tick();
+      rafId = requestAnimationFrame(loop);
+    });
+
+    onCleanup(() => {
+      cancelAnimationFrame(rafId);
+      observer.disconnect();
+    });
+  });
+
+  return (
+    <canvas
+      ref={canvasRef!}
+      class={props.widget.class?.join(" ")}
+      style={{ width: "100%", height: "100%", display: "block" }}
+    />
+  );
+}
+
 function progressStyle(widget: NormalizedWidgetNode): string {
   const value = Math.max(0, Math.min(100, Number(widget.value) || 0));
   const base = widget.style ? `${widget.style}; ` : "";
@@ -292,6 +508,8 @@ function WidgetNode(props: { widget: NormalizedWidgetNode }) {
       return <div class={classList("widgex-spacer", widget.class)} style={widget.style} />;
     case "animation":
       return <AnimationWidget widget={widget} />;
+    case "canvas":
+      return <CanvasWidget widget={widget} />;
     case "error":
       return <span class="widgex-error">{widget.text}</span>;
     default:

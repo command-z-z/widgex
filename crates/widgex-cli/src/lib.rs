@@ -116,6 +116,7 @@ enum DaemonCommand {
 enum TemplateName {
     DesktopClock,
     TopBar,
+    Particles,
 }
 
 #[derive(Debug, Subcommand)]
@@ -354,6 +355,7 @@ impl TemplateName {
         match self {
             Self::DesktopClock => "desktop-clock",
             Self::TopBar => "top-bar",
+            Self::Particles => "particles",
         }
     }
 
@@ -361,6 +363,7 @@ impl TemplateName {
         match self {
             Self::DesktopClock => DESKTOP_CLOCK_TEMPLATE,
             Self::TopBar => TOP_BAR_TEMPLATE,
+            Self::Particles => PARTICLES_TEMPLATE,
         }
     }
 
@@ -368,6 +371,7 @@ impl TemplateName {
         match self {
             Self::DesktopClock => DESKTOP_CLOCK_STYLE,
             Self::TopBar => TOP_BAR_STYLE,
+            Self::Particles => PARTICLES_STYLE,
         }
     }
 }
@@ -540,5 +544,24 @@ const DESKTOP_CLOCK_STYLE: &str = r#".widgex-window {
 .clock-time {
   font-size: 28px;
   font-weight: 600;
+}
+"#;
+
+const PARTICLES_TEMPLATE: &str = r#"version = 1
+
+[[windows]]
+id = "particles"
+layer = "bottom"
+anchor = ["top", "right", "bottom", "left"]
+click_through = true
+exclusive_zone = -1
+
+[[windows.widgets]]
+type = "canvas"
+value = '{"mode":"snow","count":120,"speed":1.0,"alpha":0.85,"wind":0.2}'
+"#;
+
+const PARTICLES_STYLE: &str = r#".widgex-window {
+  background: transparent;
 }
 "#;
