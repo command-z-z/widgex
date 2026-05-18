@@ -10,9 +10,7 @@
 //! against fresh [`SourceSnapshot`]s and pushed into the page via
 //! `window.__widgexPush`.
 //!
-//! This milestone targets Linux/Wayland only. The cross-platform window layer
-//! (tao + per-platform adapters) is a later milestone — see `PlatformAdapter`
-//! in `widgex-platform`.
+//! This crate targets Linux/Wayland only via GTK + gtk-layer-shell.
 
 use std::{
     borrow::Cow,
@@ -29,8 +27,6 @@ use std::{
     time::Duration,
 };
 
-#[allow(unused_imports)]
-use libc;
 
 use anyhow::{Context, Result, anyhow};
 use gtk::prelude::*;
@@ -232,13 +228,11 @@ pub fn run_widget_window(
         let mut snapshots: Vec<SourceSnapshot> = latest_poll_snapshots.values().cloned().collect();
         snapshots.extend(latest_listen_snapshots.values().cloned());
         let resolved = resolve_payload(&base, &snapshots);
-        if let Ok(json) = serde_json::to_string(&resolved) {
-            if json != last_pushed_json {
-                let _ = push_webview.evaluate_script(&format!(
-                    "window.__widgexPush && window.__widgexPush({json})"
-                ));
-                last_pushed_json = json;
-            }
+        if let Ok(json) = serde_json::to_string(&resolved) && json != last_pushed_json {
+            let _ = push_webview.evaluate_script(&format!(
+                "window.__widgexPush && window.__widgexPush({json})"
+            ));
+            last_pushed_json = json;
         }
         gtk::glib::ControlFlow::Continue
     });
@@ -575,13 +569,13 @@ pub fn run_renderer(
                                 .collect(),
                             ..resolved.clone()
                         };
-                        if let Ok(json) = serde_json::to_string(&win_payload) {
-                            if json != *last_pushed_json {
-                                let _ = webview.evaluate_script(&format!(
-                                    "window.__widgexPush && window.__widgexPush({json})"
-                                ));
-                                *last_pushed_json = json;
-                            }
+                        if let Ok(json) = serde_json::to_string(&win_payload)
+                            && json != *last_pushed_json
+                        {
+                            let _ = webview.evaluate_script(&format!(
+                                "window.__widgexPush && window.__widgexPush({json})"
+                            ));
+                            *last_pushed_json = json;
                         }
                     }
                     ManagedWindow::Native { renderer } => {
@@ -732,6 +726,12 @@ pub fn handle_widget_event(body: &str, config_dir: &Path, allow_shell: bool) -> 
     )
 }
 
+/// Single-quote a value for safe interpolation into a `sh -c` command string.
+/// Prevents shell metacharacters in widget event values from being interpreted.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 pub fn execute_action(
     action: &Action,
     value: Option<&str>,
@@ -746,7 +746,10 @@ pub fn execute_action(
                 ));
             }
             let command = value
-                .map(|value| command.replace("{}", value).replace("{{ value }}", value))
+                .map(|value| {
+                    let quoted = shell_quote(value);
+                    command.replace("{}", &quoted).replace("{{ value }}", &quoted)
+                })
                 .unwrap_or_else(|| command.clone());
             let mut child = Command::new("sh")
                 .arg("-c")

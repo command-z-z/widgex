@@ -224,10 +224,10 @@ impl NativeRenderer {
         window.set_title(win_spec.title.as_deref().unwrap_or(&win_spec.id));
 
         // RGBA visual → transparent window
-        if let Some(screen) = gtk::prelude::WidgetExt::screen(&window) {
-            if let Some(visual) = screen.rgba_visual() {
-                gtk::prelude::WidgetExt::set_visual(&window, Some(&visual));
-            }
+        if let Some(screen) = gtk::prelude::WidgetExt::screen(&window)
+            && let Some(visual) = screen.rgba_visual()
+        {
+            gtk::prelude::WidgetExt::set_visual(&window, Some(&visual));
         }
 
         // Fixed size (same logic as the webkit path)

@@ -5,7 +5,7 @@
 //! unix-socket listen source kinds. Other system sources parse and validate but
 //! produce empty snapshots until a later milestone.
 
-use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
+use std::{collections::BTreeMap, fs, path::Path, process::{Command, Stdio}, thread, time::Duration};
 
 use chrono::Local;
 use widgex_core::{DataSource, SourceFormat, SourceKind, SourceMode, SourceSnapshot};
@@ -150,12 +150,28 @@ fn poll_shell(source: &DataSource, cwd: &Path) -> BTreeMap<String, String> {
     };
 
     let effective_cwd: &Path = source.working_dir.as_deref().unwrap_or(cwd);
-    let Ok(output) = Command::new("sh")
+    let timeout_ms = source.timeout_ms.unwrap_or(5_000);
+
+    let Ok(child) = Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(effective_cwd)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     else {
+        return BTreeMap::new();
+    };
+
+    // Kill the child after timeout_ms so a hanging command can't block the poll thread.
+    let pid = child.id() as i32;
+    let _killer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(timeout_ms));
+        #[cfg(unix)]
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    });
+
+    let Ok(output) = child.wait_with_output() else {
         return BTreeMap::new();
     };
 
@@ -163,10 +179,7 @@ fn poll_shell(source: &DataSource, cwd: &Path) -> BTreeMap<String, String> {
         return BTreeMap::new();
     }
 
-    parse_shell_output(
-        source.format,
-        String::from_utf8_lossy(&output.stdout).as_ref(),
-    )
+    parse_shell_output(source.format, String::from_utf8_lossy(&output.stdout).as_ref())
 }
 
 fn parse_json_fields(output: &str) -> BTreeMap<String, String> {

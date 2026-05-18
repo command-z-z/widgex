@@ -213,13 +213,18 @@ impl WidgetProcessManager {
                 let window_id = self.resolve_window_id(window_id.as_deref())?;
 
                 if toggle && self.open_windows.contains(&window_id) {
-                    // Toggle close: send Close to renderer, remove from open set
-                    let _ = send_renderer_request(
+                    let close_result = send_renderer_request(
                         &self.renderer_socket,
-                        &RendererRequest::Close {
-                            window_id: window_id.clone(),
-                        },
+                        &RendererRequest::Close { window_id: window_id.clone() },
                     );
+                    if close_result.is_err() {
+                        if self.renderer_running() {
+                            return Err(anyhow!("failed to close window {window_id} in renderer"));
+                        }
+                        self.stop_all();
+                        return Ok(DaemonResponse::ok("renderer stopped")
+                            .with_open_windows(self.open_window_ids()));
+                    }
                     self.open_windows.remove(&window_id);
                     if self.open_windows.is_empty() {
                         self.wait_for_renderer_exit();
@@ -231,7 +236,7 @@ impl WidgetProcessManager {
                         .with_open_windows(self.open_window_ids()))
                 } else if !self.renderer_running() {
                     // No renderer yet — spawn one with this window as initial window
-                    self.spawn_renderer(&[window_id.clone()])?;
+                    self.spawn_renderer(std::slice::from_ref(&window_id))?;
                     self.open_windows.insert(window_id.clone());
                     Ok(DaemonResponse::ok(format!("opened {window_id}"))
                         .with_open_windows(self.open_window_ids()))
@@ -252,12 +257,18 @@ impl WidgetProcessManager {
             DaemonRequest::Close { window_id } => {
                 let window_id = self.resolve_window_id(window_id.as_deref())?;
                 if self.open_windows.contains(&window_id) {
-                    let _ = send_renderer_request(
+                    let close_result = send_renderer_request(
                         &self.renderer_socket,
-                        &RendererRequest::Close {
-                            window_id: window_id.clone(),
-                        },
+                        &RendererRequest::Close { window_id: window_id.clone() },
                     );
+                    if close_result.is_err() {
+                        if self.renderer_running() {
+                            return Err(anyhow!("failed to close window {window_id} in renderer"));
+                        }
+                        self.stop_all();
+                        return Ok(DaemonResponse::ok("renderer stopped")
+                            .with_open_windows(self.open_window_ids()));
+                    }
                     self.open_windows.remove(&window_id);
                     if self.open_windows.is_empty() {
                         self.wait_for_renderer_exit();
@@ -351,17 +362,9 @@ impl WidgetProcessManager {
         load_validated_config(&self.config_path)
             .map_err(|diagnostics| anyhow!(diagnostics_to_string(&diagnostics)))?;
 
-        self.reap_finished();
-
-        // Prefer in-process reload: WebKitWebProcess restarts but GTK windows stay open.
-        // Only fall back to kill+respawn if the renderer is dead or the request fails.
-        if self.renderer_running() {
-            if send_renderer_request(&self.renderer_socket, &RendererRequest::Reload).is_ok() {
-                return Ok(DaemonResponse::ok("renderer reloaded")
-                    .with_open_windows(self.open_window_ids()));
-            }
-        }
-
+        // Always kill+respawn so config changes (new windows, sources, CSS) take effect.
+        // In-process webview.reload() only restarts the JS runtime and cannot apply
+        // structural changes to base_payload or source threads.
         let reopen: Vec<String> = self.open_window_ids();
         self.stop_all();
 

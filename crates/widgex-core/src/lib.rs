@@ -943,7 +943,3 @@ fn binding_references(value: Option<&str>) -> Vec<String> {
         .map(|binding| binding.references)
         .unwrap_or_default()
 }
-
-pub fn default_config_path() -> PathBuf {
-    PathBuf::from("~/.config/widgex/config.toml")
-}

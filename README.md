@@ -69,13 +69,12 @@ cargo build --release
 
 ## Current MVP
 
-- Rust workspace: `widgex-core`, `widgex-source`, `widgex-webview`, `widgex-ipc`, `widgex-platform`, `widgexd`, and the `widgex` CLI.
+- Rust workspace: `widgex-core`, `widgex-source`, `widgex-webview`, `widgex-ipc`, `widgexd`, and the `widgex` CLI.
 - TOML config parsing, validation, and JSON Schema generation for editor completion.
 - Config-to-renderer JSON payload generation with `{{ source.field }}` binding resolution.
 - Live data sources (`time`, `battery`, shell command) polled in-process and pushed to the renderer.
 - SolidJS renderer running inside a `webkit2gtk` webview, anchored as a desktop layer via `gtk-layer-shell`.
 - Daemon that spawns/toggles widget windows over a Unix socket.
-- Platform capability abstraction with a Linux Wayland adapter.
 - WebView rendering uses upstream `wry` from crates.io through the normal Cargo dependency graph.
 
 The reactive loop is end-to-end: a source is polled on its `interval_ms`, bindings are
@@ -83,13 +82,13 @@ re-resolved, and the webview updates live.
 
 ## Recent Updates
 
-### Animation widget (`kind = "animation"`)
+### Animation widget (`type = "animation"`)
 
 Spritesheet-based frame animation rendered in a `<canvas>`. Config fields:
 
 ```toml
 [[windows.widgets]]
-kind = "animation"
+type = "animation"
 src = "sprite.png"
 frame_width = 192
 frame_height = 208
@@ -142,11 +141,11 @@ Widgets now support right-click and scroll-wheel actions alongside `on_click`:
 
 ```toml
 [[windows.widgets]]
-kind = "box"
-on_click      = { run = "pactl set-sink-volume @DEFAULT_SINK@ +5%" }
-on_right_click = { run = "pavucontrol" }
-on_scroll_up   = { run = "pactl set-sink-volume @DEFAULT_SINK@ +2%" }
-on_scroll_down = { run = "pactl set-sink-volume @DEFAULT_SINK@ -2%" }
+type = "box"
+on_click       = { type = "command", command = "pactl set-sink-volume @DEFAULT_SINK@ +5%" }
+on_right_click = { type = "command", command = "pavucontrol" }
+on_scroll_up   = { type = "command", command = "pactl set-sink-volume @DEFAULT_SINK@ +2%" }
+on_scroll_down = { type = "command", command = "pactl set-sink-volume @DEFAULT_SINK@ -2%" }
 ```
 
 ### Multiple theme CSS files
