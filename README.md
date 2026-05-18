@@ -76,7 +76,7 @@ cargo build --release
 - SolidJS renderer running inside a `webkit2gtk` webview, anchored as a desktop layer via `gtk-layer-shell`.
 - Daemon that spawns/toggles widget windows over a Unix socket.
 - Platform capability abstraction with a Linux Wayland adapter.
-- Single-process multi-window renderer: all WebViews share one `WebKitWebProcess` via a patched `wry` (see `vendor/wry`), reducing memory from ~350 MB × N to ~350 MB flat.
+- WebView rendering uses upstream `wry` from crates.io through the normal Cargo dependency graph.
 
 The reactive loop is end-to-end: a source is polled on its `interval_ms`, bindings are
 re-resolved, and the webview updates live.

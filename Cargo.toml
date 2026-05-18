@@ -4,16 +4,10 @@ members = [
   "crates/widgex-source",
   "crates/widgex-webview",
   "crates/widgex-ipc",
-  "crates/widgex-platform",
   "crates/widgexd",
   "crates/widgex-cli",
 ]
 resolver = "2"
-
-[patch.crates-io]
-# Vendored with SharedSecondaryProcess set so all WebViews share one renderer
-# process instead of spawning one per window (~350 MB vs ~350 MB × N).
-wry = { path = "vendor/wry" }
 
 [workspace.package]
 edition = "2024"

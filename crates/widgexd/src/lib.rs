@@ -352,6 +352,16 @@ impl WidgetProcessManager {
             .map_err(|diagnostics| anyhow!(diagnostics_to_string(&diagnostics)))?;
 
         self.reap_finished();
+
+        // Prefer in-process reload: WebKitWebProcess restarts but GTK windows stay open.
+        // Only fall back to kill+respawn if the renderer is dead or the request fails.
+        if self.renderer_running() {
+            if send_renderer_request(&self.renderer_socket, &RendererRequest::Reload).is_ok() {
+                return Ok(DaemonResponse::ok("renderer reloaded")
+                    .with_open_windows(self.open_window_ids()));
+            }
+        }
+
         let reopen: Vec<String> = self.open_window_ids();
         self.stop_all();
 

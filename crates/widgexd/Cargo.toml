@@ -14,7 +14,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 widgex-core = { path = "../widgex-core" }
 widgex-ipc = { path = "../widgex-ipc" }
-widgex-platform = { path = "../widgex-platform" }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -109,6 +109,8 @@ pub enum RendererRequest {
     Close { window_id: String },
     Stop,
     Status,
+    /// Reload all webviews in-process. GTK windows stay open; only WebKitWebProcess restarts.
+    Reload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
