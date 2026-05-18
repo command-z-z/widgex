@@ -4,6 +4,69 @@ Widgex is an early-stage modern widget runtime inspired by Eww, AGS, Quickshell,
 
 The first implementation target is Arch Linux on Wayland. The architecture keeps platform adapters separate so Windows and macOS support can be added without replacing the configuration model or renderer contract.
 
+## Installation
+
+### Arch Linux (AUR) — recommended
+
+```bash
+# Using yay
+yay -S widgex-git
+
+# Using paru
+paru -S widgex-git
+
+# Manual (makepkg)
+git clone https://aur.archlinux.org/widgex-git.git
+cd widgex-git
+makepkg -si
+```
+
+**Runtime dependencies** installed automatically by the AUR package:
+
+| Package | Purpose |
+|---|---|
+| `webkit2gtk-4.1` | WebView renderer engine |
+| `gtk3` | Window toolkit |
+| `gtk-layer-shell` | Wayland layer-shell anchoring |
+
+After installation, start the daemon as a systemd user service:
+
+```bash
+# One-time setup
+widgex init --config ~/.config/widgex/config.toml
+
+# Start daemon (manual)
+widgex daemon start --config ~/.config/widgex/config.toml
+
+# Or via systemd (auto-start on login)
+systemctl --user enable --now widgex.service
+```
+
+Toggle widget windows by id:
+
+```bash
+widgex open --toggle <window-id>
+widgex daemon reload   # apply config changes without restarting
+widgex daemon status
+```
+
+### Build from source
+
+Requires `rust` (stable), `nodejs`, `npm`, plus the runtime dependencies above.
+
+```bash
+git clone https://github.com/command-z-z/widgex.git
+cd widgex
+
+# Build the SolidJS renderer (embedded into the binary)
+cd apps/renderer && npm ci && npm run build && cd ../..
+
+# Build release binaries
+cargo build --release
+
+# Binaries: target/release/widgex  target/release/widgexd
+```
+
 ## Current MVP
 
 - Rust workspace: `widgex-core`, `widgex-source`, `widgex-webview`, `widgex-ipc`, `widgex-platform`, `widgexd`, and the `widgex` CLI.
