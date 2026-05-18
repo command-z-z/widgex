@@ -128,6 +128,62 @@ text = "{{ uptime.stdout }}"
 }
 
 #[test]
+fn accepts_unix_socket_listen_sources_with_path() {
+    let config = parse_config_str(
+        r#"
+version = 1
+
+[[sources]]
+id = "hypr_events"
+kind = "unix_socket"
+mode = "listen"
+format = "hyprland_event"
+path = "$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock"
+
+[[windows]]
+id = "bar"
+
+[[windows.widgets]]
+type = "label"
+text = "{{ hypr_events.event }}"
+"#,
+    )
+    .expect("config syntax should parse");
+
+    validate_config(&config).expect("unix socket listen source should validate");
+    assert_eq!(config.sources[0].kind, SourceKind::UnixSocket);
+    assert_eq!(config.sources[0].mode, SourceMode::Listen);
+    assert_eq!(config.sources[0].format, SourceFormat::HyprlandEvent);
+}
+
+#[test]
+fn rejects_unix_socket_sources_without_path() {
+    let config = parse_config_str(
+        r#"
+version = 1
+
+[[sources]]
+id = "events"
+kind = "unix_socket"
+mode = "listen"
+
+[[windows]]
+id = "bar"
+"#,
+    )
+    .expect("config syntax should parse");
+
+    let diagnostics = validate_config(&config).expect_err("missing socket path should fail");
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "sources[0].path"
+            && diagnostic
+                .message
+                .contains("unix_socket source requires a path")
+    }));
+}
+
+#[test]
 fn rejects_command_actions_unless_permission_is_enabled() {
     let config = parse_config_str(
         r#"
@@ -143,6 +199,18 @@ text = "Play"
 [windows.widgets.on_click]
 type = "command"
 command = "playerctl play-pause"
+
+[windows.widgets.on_right_click]
+type = "command"
+command = "playerctl stop"
+
+[windows.widgets.on_scroll_up]
+type = "command"
+command = "playerctl next"
+
+[windows.widgets.on_scroll_down]
+type = "command"
+command = "playerctl previous"
 "#,
     )
     .expect("config syntax should parse");
@@ -151,6 +219,24 @@ command = "playerctl play-pause"
 
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.path == "windows[0].widgets[0].on_click"
+            && diagnostic
+                .message
+                .contains("command action requires permissions.allow_shell")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "windows[0].widgets[0].on_right_click"
+            && diagnostic
+                .message
+                .contains("command action requires permissions.allow_shell")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "windows[0].widgets[0].on_scroll_up"
+            && diagnostic
+                .message
+                .contains("command action requires permissions.allow_shell")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "windows[0].widgets[0].on_scroll_down"
             && diagnostic
                 .message
                 .contains("command action requires permissions.allow_shell")
@@ -285,6 +371,18 @@ value = "20"
 [windows.widgets.on_change]
 type = "command"
 command = "./seek.sh {}"
+
+[windows.widgets.on_right_click]
+type = "command"
+command = "./menu.sh"
+
+[windows.widgets.on_scroll_up]
+type = "command"
+command = "./next.sh"
+
+[windows.widgets.on_scroll_down]
+type = "command"
+command = "./previous.sh"
 "#,
     )
     .expect("config syntax should parse");
@@ -295,6 +393,24 @@ command = "./seek.sh {}"
         payload.windows[0].widgets[0].on_change,
         Some(Action::Command {
             command: "./seek.sh {}".to_string()
+        })
+    );
+    assert_eq!(
+        payload.windows[0].widgets[0].on_right_click,
+        Some(Action::Command {
+            command: "./menu.sh".to_string()
+        })
+    );
+    assert_eq!(
+        payload.windows[0].widgets[0].on_scroll_up,
+        Some(Action::Command {
+            command: "./next.sh".to_string()
+        })
+    );
+    assert_eq!(
+        payload.windows[0].widgets[0].on_scroll_down,
+        Some(Action::Command {
+            command: "./previous.sh".to_string()
         })
     );
 }

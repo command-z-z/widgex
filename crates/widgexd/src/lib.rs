@@ -11,11 +11,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use widgex_core::{Config, diagnostics_to_string, load_validated_config};
-use widgex_ipc::{DaemonRequest, DaemonResponse, RendererRequest, send_renderer_request};
+use widgex_core::{diagnostics_to_string, load_validated_config, Config};
+use widgex_ipc::{send_renderer_request, DaemonRequest, DaemonResponse, RendererRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonCommand {
@@ -143,6 +143,8 @@ impl WidgetProcessTable {
         match request {
             DaemonRequest::Status => DaemonResponse::ok("daemon running")
                 .with_open_windows(self.open_windows.iter().cloned().collect()),
+            DaemonRequest::Reload => DaemonResponse::ok("daemon reloaded")
+                .with_open_windows(self.open_windows.iter().cloned().collect()),
             DaemonRequest::Stop => DaemonResponse::ok("daemon stopping")
                 .with_open_windows(self.open_windows.iter().cloned().collect()),
             DaemonRequest::Open { window_id, toggle } => {
@@ -202,6 +204,7 @@ impl WidgetProcessManager {
                 self.reap_finished();
                 Ok(DaemonResponse::ok("daemon running").with_open_windows(self.open_window_ids()))
             }
+            DaemonRequest::Reload => self.reload_renderer(),
             DaemonRequest::Stop => {
                 self.stop_all();
                 Ok(DaemonResponse::ok("daemon stopping"))
@@ -213,7 +216,9 @@ impl WidgetProcessManager {
                     // Toggle close: send Close to renderer, remove from open set
                     let _ = send_renderer_request(
                         &self.renderer_socket,
-                        &RendererRequest::Close { window_id: window_id.clone() },
+                        &RendererRequest::Close {
+                            window_id: window_id.clone(),
+                        },
                     );
                     self.open_windows.remove(&window_id);
                     if self.open_windows.is_empty() {
@@ -234,7 +239,9 @@ impl WidgetProcessManager {
                     // Renderer already running — ask it to open another window
                     send_renderer_request(
                         &self.renderer_socket,
-                        &RendererRequest::Open { window_id: window_id.clone() },
+                        &RendererRequest::Open {
+                            window_id: window_id.clone(),
+                        },
                     )
                     .with_context(|| format!("failed to open window {window_id} in renderer"))?;
                     self.open_windows.insert(window_id.clone());
@@ -247,7 +254,9 @@ impl WidgetProcessManager {
                 if self.open_windows.contains(&window_id) {
                     let _ = send_renderer_request(
                         &self.renderer_socket,
-                        &RendererRequest::Close { window_id: window_id.clone() },
+                        &RendererRequest::Close {
+                            window_id: window_id.clone(),
+                        },
                     );
                     self.open_windows.remove(&window_id);
                     if self.open_windows.is_empty() {
@@ -338,6 +347,22 @@ impl WidgetProcessManager {
         ))
     }
 
+    fn reload_renderer(&mut self) -> Result<DaemonResponse> {
+        load_validated_config(&self.config_path)
+            .map_err(|diagnostics| anyhow!(diagnostics_to_string(&diagnostics)))?;
+
+        self.reap_finished();
+        let reopen: Vec<String> = self.open_window_ids();
+        self.stop_all();
+
+        if !reopen.is_empty() {
+            self.spawn_renderer(&reopen)?;
+            self.open_windows = reopen.iter().cloned().collect();
+        }
+
+        Ok(DaemonResponse::ok("daemon reloaded").with_open_windows(self.open_window_ids()))
+    }
+
     pub fn stop_all(&mut self) {
         // Ask the renderer to stop gracefully (best-effort).
         let _ = send_renderer_request(&self.renderer_socket, &RendererRequest::Stop);
@@ -360,7 +385,7 @@ impl WidgetProcessManager {
     pub fn reap_finished(&mut self) {
         let gone = match self.renderer_child.as_mut().map(|c| c.try_wait()) {
             None => false,
-            Some(Ok(None)) => false,               // still running
+            Some(Ok(None)) => false,                  // still running
             Some(Ok(Some(_))) | Some(Err(_)) => true, // exited or error → treat as gone
         };
 
@@ -378,7 +403,9 @@ impl WidgetProcessManager {
     /// Wait for the renderer child to exit (called when open_windows becomes empty).
     /// Sends SIGTERM, polls for up to 500 ms, then force-kills with SIGKILL.
     fn wait_for_renderer_exit(&mut self) {
-        let Some(ref mut child) = self.renderer_child else { return };
+        let Some(ref mut child) = self.renderer_child else {
+            return;
+        };
         let pid = child.id() as i32;
         unsafe { libc::killpg(pid, libc::SIGTERM) };
         for _ in 0..5 {

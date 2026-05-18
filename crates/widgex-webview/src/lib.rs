@@ -41,9 +41,13 @@ use widgex_core::{
     Action, AnchorEdge, DataSource, RendererPayload, RendererSource, RendererWidget,
     RendererWindow, SourceKind, SourceMode, SourceSnapshot, WindowLayer, resolve_payload,
 };
+
+mod native_renderer;
+use native_renderer::NativeRenderer;
 use widgex_ipc::{RendererRequest, RendererResponse};
+use webkit2gtk::WebView as GtkWebView;
 use wry::{
-    WebContext, WebViewBuilder, WebViewBuilderExtUnix,
+    WebContext, WebViewBuilder, WebViewBuilderExtUnix, WebViewExtUnix,
     http::{Request, Response, header::CONTENT_TYPE},
 };
 
@@ -270,27 +274,67 @@ struct RendererState {
     base_payload: RendererPayload,
     config_dir: PathBuf,
     allow_shell: bool,
+    /// Must outlive all webviews — kept here so it lives as long as RendererState.
+    _web_context: WebContext,
+    /// Invisible 1×1 window hosting the anchor WebView; must stay alive.
+    _anchor_gtk_window: gtk::OffscreenWindow,
+    /// Wry handle for the anchor WebView; keeps the GObject ref alive.
+    _anchor_webview: wry::WebView,
+    /// webkit2gtk handle cloned and passed as `related_view` to each new window,
+    /// so all widget WebViews share one WebKitWebProcess with the anchor.
+    anchor_wkwebview: GtkWebView,
 }
 
-/// One GTK window + its webview, tracked by the multi-window runner.
-struct ManagedWindow {
-    gtk_window: gtk::Window,
-    webview: Rc<wry::WebView>,
-    last_pushed_json: String,
+/// One GTK window tracked by the multi-window runner.
+/// Either a webkit WebView window or a native GTK renderer window.
+enum ManagedWindow {
+    Webkit {
+        gtk_window: gtk::Window,
+        webview: Rc<wry::WebView>,
+        last_pushed_json: String,
+    },
+    Native {
+        renderer: NativeRenderer,
+    },
+}
+
+impl ManagedWindow {
+    fn gtk_window(&self) -> &gtk::Window {
+        match self {
+            ManagedWindow::Webkit { gtk_window, .. } => gtk_window,
+            ManagedWindow::Native { renderer } => &renderer.window,
+        }
+    }
 }
 
 /// Open the selected widget window as a layer-shell-anchored webview.
-/// Uses a shared `WebContext` so all windows share one WebKit network process.
+///
+/// `anchor` is the always-alive WebView that all windows pass as `related_view`
+/// to webkit2gtk, placing them in the same WebKitWebProcess.
 ///
 /// Returns the `ManagedWindow` on success. The caller must insert it into
 /// `state.windows`.
 fn add_window(
     window_id: &str,
     state: &RendererState,
-    web_context: &mut WebContext,
     destroyed_ids: Rc<RefCell<BTreeSet<String>>>,
+    anchor: &GtkWebView,
 ) -> Result<ManagedWindow> {
     let window_spec = select_window(&state.base_payload, Some(window_id))?.clone();
+
+    // Linux-only workaround for webkit2gtk transparent-window ghost pixels (wry#1524).
+    // When native_render = true, use a GTK widget tree instead of a WebView.
+    #[cfg(target_os = "linux")]
+    if window_spec.native_render {
+        let all_css = state.base_payload.theme_css.as_deref();
+        let renderer = NativeRenderer::new(&window_spec, &state.config_dir, all_css)
+            .ok_or_else(|| anyhow!("failed to create native renderer for {window_id:?}"))?;
+        let id_for_destroy = window_id.to_string();
+        renderer.window.connect_destroy(move |_| {
+            destroyed_ids.borrow_mut().insert(id_for_destroy.clone());
+        });
+        return Ok(ManagedWindow::Native { renderer });
+    }
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title(window_spec.title.as_deref().unwrap_or(&window_spec.id));
@@ -328,9 +372,11 @@ fn add_window(
     let initial = resolve_payload(&state.base_payload, &[]);
     let init_script = format!(
         "window.__WIDGEX_PAYLOAD__ = {};\
+         window.__WIDGEX_WINDOW_ID__ = {};\
          window.__widgex_queue=[];\
          window.__widgexPush=function(p){{window.__widgex_queue.push(p);}};",
-        serde_json::to_string(&initial)?
+        serde_json::to_string(&initial)?,
+        serde_json::to_string(window_id)?
     );
 
     let config_dir = state.config_dir.clone();
@@ -340,11 +386,10 @@ fn add_window(
         .clone()
         .unwrap_or_else(|| config_dir.clone());
 
-    // The "widgex" custom protocol is registered once on the shared WebContext.
-    // Subsequent calls with the same context must NOT re-register it.
-    let protocol_already_registered = web_context.is_custom_protocol_registered("widgex");
-
-    let builder = WebViewBuilder::new_with_web_context(web_context)
+    // with_related_view places this WebView in the same WebKitWebProcess as the
+    // anchor and inherits its WebContext (including the widgex:// protocol).
+    let webview = WebViewBuilder::new()
+        .with_related_view(anchor.clone())
         .with_url("widgex://localhost/index.html")
         .with_transparent(true)
         .with_initialization_script(init_script)
@@ -354,18 +399,7 @@ fn add_window(
                     eprintln!("widgex ipc error: {e}");
                 }
             }
-        });
-
-    let builder = if protocol_already_registered {
-        builder
-    } else {
-        builder.with_custom_protocol("widgex".to_string(), {
-            let config_dir = config_dir.clone();
-            move |id, request| serve_asset(id, request, &config_dir)
         })
-    };
-
-    let webview = builder
         .build_gtk(&window)
         .map_err(|e| anyhow!("failed to create webview: {e}"))?;
     let webview = Rc::new(webview);
@@ -382,7 +416,7 @@ fn add_window(
         destroyed_ids.borrow_mut().insert(id_for_destroy.clone());
     });
 
-    Ok(ManagedWindow {
+    Ok(ManagedWindow::Webkit {
         gtk_window: window,
         webview,
         last_pushed_json: String::new(),
@@ -426,6 +460,25 @@ pub fn run_renderer(
             .map(|s| (s.id.clone(), s))
             .collect();
 
+    // One shared WebContext → one WebKit network process for all windows.
+    // The widgex:// protocol is registered on this context via the anchor WebView.
+    let mut web_context = WebContext::new(None);
+
+    // Anchor WebView: invisible 1×1 offscreen window that is the stable
+    // `related_view` reference for every widget WebView. All widget WebViews
+    // share the anchor's renderer process instead of spawning one each.
+    let anchor_gtk_window = gtk::OffscreenWindow::new();
+    anchor_gtk_window.set_size_request(1, 1);
+    anchor_gtk_window.show_all();
+    let anchor_webview = WebViewBuilder::new_with_web_context(&mut web_context)
+        .with_custom_protocol("widgex".to_string(), {
+            let config_dir = config_dir.clone();
+            move |id, request| serve_asset(id, request, &config_dir)
+        })
+        .build_gtk(&anchor_gtk_window)
+        .map_err(|e| anyhow!("failed to create anchor webview: {e}"))?;
+    let anchor_wkwebview = anchor_webview.webview();
+
     let state = Rc::new(RefCell::new(RendererState {
         windows: BTreeMap::new(),
         global_poll_snapshots: BTreeMap::new(),
@@ -433,17 +486,28 @@ pub fn run_renderer(
         base_payload: base,
         config_dir: config_dir.clone(),
         allow_shell,
+        _web_context: web_context,
+        _anchor_gtk_window: anchor_gtk_window,
+        _anchor_webview: anchor_webview,
+        anchor_wkwebview,
     }));
 
     // IDs of windows whose GTK windows were destroyed by the user (not by us).
     let destroyed_ids: Rc<RefCell<BTreeSet<String>>> = Rc::new(RefCell::new(BTreeSet::new()));
 
-    // One shared WebContext → one WebKit network process for all windows.
-    let mut web_context = WebContext::new(None);
-
     // Open initial windows.
     for &id in initial_window_ids {
-        match add_window(id, &state.borrow(), &mut web_context, Rc::clone(&destroyed_ids)) {
+        // Clone anchor handle before borrowing state to avoid holding two borrows.
+        let anchor = state.borrow().anchor_wkwebview.clone();
+        // Evaluate add_window in its own block so the Ref guard from
+        // state.borrow() is dropped before the match arms run.  If the borrow
+        // lived into the Ok arm (Rust extends scrutinee temporaries to the end
+        // of the match block), the subsequent state.borrow_mut() would panic.
+        let result = {
+            let st = state.borrow();
+            add_window(id, &st, Rc::clone(&destroyed_ids), &anchor)
+        };
+        match result {
             Ok(managed) => {
                 state.borrow_mut().windows.insert(id.to_string(), managed);
             }
@@ -467,9 +531,6 @@ pub fn run_renderer(
     // GTK tick: drain channels, poll control socket, push changed payloads.
     let state_tick = Rc::clone(&state);
     let destroyed_tick = Rc::clone(&destroyed_ids);
-    // web_context must outlive the webviews; move it into the tick closure so
-    // it is kept alive until the loop exits.
-    let mut web_context = web_context;
     gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
         // ── Drain destroyed-window notifications ──────────────────────────
         {
@@ -506,7 +567,6 @@ pub fn run_renderer(
                         &mut stream,
                         &state_tick,
                         &destroyed_tick,
-                        &mut web_context,
                     );
                     if let Some((resp, stop)) = response {
                         if let Ok(line) = resp.to_json_line() {
@@ -537,13 +597,37 @@ pub fn run_renderer(
             // mutable windows iteration.
             let base_payload = st.base_payload.clone();
             let resolved = resolve_payload(&base_payload, &snapshots);
-            if let Ok(json) = serde_json::to_string(&resolved) {
-                for managed in st.windows.values_mut() {
-                    if json != managed.last_pushed_json {
-                        let _ = managed.webview.evaluate_script(&format!(
-                            "window.__widgexPush && window.__widgexPush({json})"
-                        ));
-                        managed.last_pushed_json = json.clone();
+            for (window_id, managed) in st.windows.iter_mut() {
+                match managed {
+                    ManagedWindow::Webkit { webview, last_pushed_json, .. } => {
+                        // Build a single-window payload so evaluate_script is
+                        // only called when THIS window's data actually changed.
+                        // Pushing the full multi-window payload would fire on
+                        // every source tick (e.g. the pet 100 ms brain source),
+                        // flooding WebKit with 300+ KB/call and causing runaway
+                        // memory growth in WebKitWebProcess.
+                        let win_payload = RendererPayload {
+                            windows: resolved
+                                .windows
+                                .iter()
+                                .filter(|w| w.id == *window_id)
+                                .cloned()
+                                .collect(),
+                            ..resolved.clone()
+                        };
+                        if let Ok(json) = serde_json::to_string(&win_payload) {
+                            if json != *last_pushed_json {
+                                let _ = webview.evaluate_script(&format!(
+                                    "window.__widgexPush && window.__widgexPush({json})"
+                                ));
+                                *last_pushed_json = json;
+                            }
+                        }
+                    }
+                    ManagedWindow::Native { renderer } => {
+                        if let Some(win_data) = resolved.windows.iter().find(|w| w.id == *window_id) {
+                            renderer.update(win_data);
+                        }
                     }
                 }
             }
@@ -576,7 +660,6 @@ fn handle_control_request(
     stream: &mut std::os::unix::net::UnixStream,
     state: &Rc<RefCell<RendererState>>,
     destroyed_ids: &Rc<RefCell<BTreeSet<String>>>,
-    web_context: &mut WebContext,
 ) -> Option<(RendererResponse, bool)> {
     let mut line = String::new();
     if BufReader::new(&*stream).read_line(&mut line).is_err() || line.is_empty() {
@@ -604,20 +687,19 @@ fn handle_control_request(
             Some((RendererResponse::ok("stopping"), true))
         }
         RendererRequest::Open { window_id } => {
-            let st = state.borrow();
-            if st.windows.contains_key(&window_id) {
+            let already_open = state.borrow().windows.contains_key(&window_id);
+            if already_open {
                 return Some((
                     RendererResponse::ok(format!("window {window_id:?} already open")),
                     false,
                 ));
             }
-            drop(st);
-            match add_window(
-                &window_id,
-                &state.borrow(),
-                web_context,
-                Rc::clone(destroyed_ids),
-            ) {
+            let anchor = state.borrow().anchor_wkwebview.clone();
+            let result = {
+                let st = state.borrow();
+                add_window(&window_id, &st, Rc::clone(destroyed_ids), &anchor)
+            };
+            match result {
                 Ok(managed) => {
                     state.borrow_mut().windows.insert(window_id.clone(), managed);
                     Some((RendererResponse::ok(format!("opened {window_id:?}")), false))
@@ -644,14 +726,11 @@ fn handle_control_request(
                 // SAFETY: we have exclusive ownership of this window; it is no
                 // longer referenced by any other part of the program after
                 // removal from state.windows above.
-                unsafe { managed.gtk_window.destroy() };
+                unsafe { managed.gtk_window().destroy() };
                 // The connect_destroy callback may have inserted window_id into
                 // destroyed_ids. Remove it so the tick loop skips it.
                 destroyed_ids.borrow_mut().remove(&window_id);
-                if will_be_empty {
-                    gtk::main_quit();
-                }
-                Some((RendererResponse::ok(format!("closed {window_id:?}")), false))
+                Some((RendererResponse::ok(format!("closed {window_id:?}")), will_be_empty))
             } else {
                 Some((
                     RendererResponse::error(format!("window {window_id:?} not found")),
@@ -697,7 +776,7 @@ pub fn execute_action(
             let command = value
                 .map(|value| command.replace("{}", value).replace("{{ value }}", value))
                 .unwrap_or_else(|| command.clone());
-            Command::new("sh")
+            let mut child = Command::new("sh")
                 .arg("-c")
                 .arg(command)
                 .current_dir(config_dir)
@@ -706,6 +785,10 @@ pub fn execute_action(
                 .stderr(Stdio::null())
                 .spawn()
                 .context("failed to execute command action")?;
+            // Reap the child so it never becomes a zombie.  We do not care
+            // about the exit status — fire-and-forget — but we must call
+            // wait() or the kernel holds the exit record until the parent dies.
+            thread::spawn(move || { let _ = child.wait(); });
         }
         Action::Emit { event } => {
             eprintln!("widgex event emitted: {event}");

@@ -17,4 +17,24 @@ describe("normalizeWidgetTree", () => {
       },
     ]);
   });
+
+  it("preserves click, right-click, and scroll actions", () => {
+    const action = { type: "command" as const, command: "true" };
+    const tree = normalizeWidgetTree([
+      {
+        type: "box",
+        on_click: action,
+        on_right_click: action,
+        on_scroll_up: action,
+        on_scroll_down: action,
+      },
+    ]);
+
+    expect(tree[0]).toMatchObject({
+      on_click: action,
+      on_right_click: action,
+      on_scroll_up: action,
+      on_scroll_down: action,
+    });
+  });
 });

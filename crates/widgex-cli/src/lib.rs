@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use widgex_core::{
-    Config, diagnostics_to_string, load_validated_config, renderer_payload_from_config,
-    schema_json_pretty,
+    diagnostics_to_string, load_validated_config, renderer_payload_from_config, schema_json_pretty,
+    Config,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +99,12 @@ enum DaemonCommand {
         dry_run: bool,
     },
     Stop {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Reload {
         #[arg(long)]
         socket: Option<PathBuf>,
         #[arg(long)]
@@ -289,6 +295,20 @@ fn run_cli(cli: Cli) -> Result<CliOutput> {
                     let response =
                         widgex_ipc::send_request(&socket, &widgex_ipc::DaemonRequest::Stop)?;
                     response.message
+                }
+            }
+            DaemonCommand::Reload { socket, dry_run } => {
+                let socket = socket.unwrap_or_else(widgex_ipc::default_socket_path);
+                if dry_run {
+                    format!("would reload daemon at {}", socket.display())
+                } else {
+                    let response =
+                        widgex_ipc::send_request(&socket, &widgex_ipc::DaemonRequest::Reload)?;
+                    if response.ok {
+                        format_daemon_response(response)
+                    } else {
+                        return Err(anyhow!(response.message));
+                    }
                 }
             }
         })),
