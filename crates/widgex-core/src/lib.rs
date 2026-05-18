@@ -29,6 +29,10 @@ pub struct Config {
 pub struct Theme {
     #[serde(default)]
     pub css: Option<String>,
+    /// Additional CSS files loaded after `css`. Useful for separating a
+    /// variables/theme file from the global reset stylesheet.
+    #[serde(default)]
+    pub css_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -51,6 +55,14 @@ pub struct DataSource {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub command: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Set at load time to the module's directory so shell commands in that
+    /// module run relative to the widget directory rather than the root
+    /// config directory. Not serialised — derived from the module file path.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub working_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -67,6 +79,7 @@ pub enum SourceFormat {
     #[default]
     Text,
     Json,
+    HyprlandEvent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -78,6 +91,7 @@ pub enum SourceKind {
     Memory,
     Network,
     Shell,
+    UnixSocket,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -99,8 +113,18 @@ pub struct WindowSpec {
     pub click_through: bool,
     #[serde(default)]
     pub monitor: Option<String>,
+    /// Use native GTK rendering instead of webkit for this window.
+    /// Linux/Hyprland workaround for the webkit2gtk transparent-window ghost bug
+    /// (wry#1524). Remove this flag when the upstream issue is fixed.
+    #[serde(default)]
+    pub native_render: bool,
     #[serde(default)]
     pub widgets: Vec<WidgetNode>,
+    /// Module directory for this window; widget action commands (on_click etc.)
+    /// run relative to this path. Not serialised — set during module expansion.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub working_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -156,6 +180,22 @@ pub struct WidgetNode {
     #[serde(default)]
     pub src: Option<String>,
     #[serde(default)]
+    pub frame_width: Option<u32>,
+    #[serde(default)]
+    pub frame_height: Option<u32>,
+    #[serde(default)]
+    pub cols: Option<u32>,
+    #[serde(default)]
+    pub frame_row: Option<String>,
+    #[serde(default)]
+    pub frame_count: Option<String>,
+    #[serde(default)]
+    pub draw_x: Option<String>,
+    #[serde(default)]
+    pub draw_y: Option<String>,
+    #[serde(default)]
+    pub frame_durations: Vec<u32>,
+    #[serde(default)]
     pub style: Option<String>,
     #[serde(default)]
     pub direction: Option<Direction>,
@@ -163,6 +203,12 @@ pub struct WidgetNode {
     pub on_click: Option<Action>,
     #[serde(default)]
     pub on_change: Option<Action>,
+    #[serde(default)]
+    pub on_right_click: Option<Action>,
+    #[serde(default)]
+    pub on_scroll_up: Option<Action>,
+    #[serde(default)]
+    pub on_scroll_down: Option<Action>,
     #[serde(default)]
     pub children: Vec<WidgetNode>,
 }
@@ -176,6 +222,7 @@ pub enum WidgetKind {
     Image,
     Progress,
     Spacer,
+    Animation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -249,7 +296,11 @@ pub struct RendererWindow {
     pub exclusive_zone: Option<i32>,
     pub click_through: bool,
     pub monitor: Option<String>,
+    #[serde(default)]
+    pub native_render: bool,
     pub widgets: Vec<RendererWidget>,
+    #[serde(skip)]
+    pub working_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,10 +321,21 @@ pub struct RendererWidget {
     pub text: Option<String>,
     pub value: Option<String>,
     pub src: Option<String>,
+    pub frame_width: Option<u32>,
+    pub frame_height: Option<u32>,
+    pub cols: Option<u32>,
+    pub frame_row: Option<String>,
+    pub frame_count: Option<String>,
+    pub draw_x: Option<String>,
+    pub draw_y: Option<String>,
+    pub frame_durations: Vec<u32>,
     pub style: Option<String>,
     pub direction: Option<Direction>,
     pub on_click: Option<Action>,
     pub on_change: Option<Action>,
+    pub on_right_click: Option<Action>,
+    pub on_scroll_up: Option<Action>,
+    pub on_scroll_down: Option<Action>,
     pub bindings: Option<RendererWidgetBindings>,
     pub children: Vec<RendererWidget>,
 }
@@ -283,6 +345,10 @@ pub struct RendererWidgetBindings {
     pub text: Vec<String>,
     pub value: Vec<String>,
     pub src: Vec<String>,
+    pub frame_row: Vec<String>,
+    pub frame_count: Vec<String>,
+    pub draw_x: Vec<String>,
+    pub draw_y: Vec<String>,
     pub style: Vec<String>,
 }
 
@@ -377,11 +443,22 @@ pub fn validate_config(config: &Config) -> Result<(), Vec<ConfigDiagnostic>> {
             }
         }
 
-        if source.mode == SourceMode::Listen && source.kind != SourceKind::Shell {
+        if source.kind == SourceKind::UnixSocket && source.path.as_deref().is_none_or(str::is_empty)
+        {
+            diagnostics.push(ConfigDiagnostic::new(
+                format!("sources[{index}].path"),
+                "unix_socket source requires a path",
+                "set path = \"$XDG_RUNTIME_DIR/your/socket.sock\"",
+            ));
+        }
+
+        if source.mode == SourceMode::Listen
+            && !matches!(source.kind, SourceKind::Shell | SourceKind::UnixSocket)
+        {
             diagnostics.push(ConfigDiagnostic::new(
                 format!("sources[{index}].mode"),
-                "listen mode is only supported for shell sources",
-                "use kind = \"shell\" for long-running command sources",
+                "listen mode is only supported for shell and unix_socket sources",
+                "use kind = \"shell\" for long-running commands or kind = \"unix_socket\" for socket streams",
             ));
         }
     }
@@ -455,11 +532,13 @@ pub fn renderer_payload_from_config(
                 exclusive_zone: window.exclusive_zone,
                 click_through: window.click_through,
                 monitor: window.monitor.clone(),
+                native_render: window.native_render,
                 widgets: window
                     .widgets
                     .iter()
                     .map(renderer_widget_from_config)
                     .collect(),
+                working_dir: window.working_dir.clone(),
             })
             .collect(),
         sources: config
@@ -492,8 +571,15 @@ fn expand_config_modules(
 ) -> Result<Config, Vec<ConfigDiagnostic>> {
     let root_dir = root_path.parent().unwrap_or_else(|| Path::new("."));
     let mut css_files = Vec::new();
-    if let Some(css) = config.theme.as_ref().and_then(|theme| theme.css.as_ref()) {
-        css_files.push(css.clone());
+    // Theme palette/variable files come first so --ctp-* variables are defined
+    // before the global stylesheet and widget stylesheets that reference them.
+    if let Some(theme) = config.theme.as_ref() {
+        for css in &theme.css_files {
+            css_files.push(css.clone());
+        }
+        if let Some(css) = &theme.css {
+            css_files.push(css.clone());
+        }
     }
 
     for module_ref in config.modules.clone() {
@@ -513,8 +599,16 @@ fn expand_config_modules(
             css_files.push(path_relative_to_or_absolute(&css_path, root_dir));
         }
 
-        config.sources.extend(module.sources);
-        config.windows.extend(module.windows);
+        let mut module_sources = module.sources;
+        for source in module_sources.iter_mut() {
+            source.working_dir = Some(module_dir.to_path_buf());
+        }
+        config.sources.extend(module_sources);
+        let mut module_windows = module.windows;
+        for window in module_windows.iter_mut() {
+            window.working_dir = Some(module_dir.to_path_buf());
+        }
+        config.windows.extend(module_windows);
     }
 
     config.css_files = css_files;
@@ -610,6 +704,18 @@ fn resolve_widget(widget: &mut RendererWidget, snapshots: &[SourceSnapshot]) {
     }
     if let Some(src) = &widget.src {
         widget.src = Some(resolve_template(src, snapshots));
+    }
+    if let Some(frame_row) = &widget.frame_row {
+        widget.frame_row = Some(resolve_template(frame_row, snapshots));
+    }
+    if let Some(frame_count) = &widget.frame_count {
+        widget.frame_count = Some(resolve_template(frame_count, snapshots));
+    }
+    if let Some(draw_x) = &widget.draw_x {
+        widget.draw_x = Some(resolve_template(draw_x, snapshots));
+    }
+    if let Some(draw_y) = &widget.draw_y {
+        widget.draw_y = Some(resolve_template(draw_y, snapshots));
     }
     if let Some(style) = &widget.style {
         widget.style = Some(resolve_template(style, snapshots));
@@ -741,6 +847,9 @@ fn validate_widget(
     for (field, action) in [
         ("on_click", &widget.on_click),
         ("on_change", &widget.on_change),
+        ("on_right_click", &widget.on_right_click),
+        ("on_scroll_up", &widget.on_scroll_up),
+        ("on_scroll_down", &widget.on_scroll_down),
     ] {
         if matches!(action, Some(Action::Command { .. })) && !allow_shell {
             diagnostics.push(ConfigDiagnostic::new(
@@ -770,10 +879,21 @@ fn renderer_widget_from_config(widget: &WidgetNode) -> RendererWidget {
         text: widget.text.clone(),
         value: widget.value.clone(),
         src: widget.src.clone(),
+        frame_width: widget.frame_width,
+        frame_height: widget.frame_height,
+        cols: widget.cols,
+        frame_row: widget.frame_row.clone(),
+        frame_count: widget.frame_count.clone(),
+        draw_x: widget.draw_x.clone(),
+        draw_y: widget.draw_y.clone(),
+        frame_durations: widget.frame_durations.clone(),
         style: widget.style.clone(),
         direction: widget.direction,
         on_click: widget.on_click.clone(),
         on_change: widget.on_change.clone(),
+        on_right_click: widget.on_right_click.clone(),
+        on_scroll_up: widget.on_scroll_up.clone(),
+        on_scroll_down: widget.on_scroll_down.clone(),
         bindings: renderer_bindings_for_widget(widget),
         children: widget
             .children
@@ -787,15 +907,31 @@ fn renderer_bindings_for_widget(widget: &WidgetNode) -> Option<RendererWidgetBin
     let text = binding_references(widget.text.as_deref());
     let value = binding_references(widget.value.as_deref());
     let src = binding_references(widget.src.as_deref());
+    let frame_row = binding_references(widget.frame_row.as_deref());
+    let frame_count = binding_references(widget.frame_count.as_deref());
+    let draw_x = binding_references(widget.draw_x.as_deref());
+    let draw_y = binding_references(widget.draw_y.as_deref());
     let style = binding_references(widget.style.as_deref());
 
-    if text.is_empty() && value.is_empty() && src.is_empty() && style.is_empty() {
+    if text.is_empty()
+        && value.is_empty()
+        && src.is_empty()
+        && frame_row.is_empty()
+        && frame_count.is_empty()
+        && draw_x.is_empty()
+        && draw_y.is_empty()
+        && style.is_empty()
+    {
         None
     } else {
         Some(RendererWidgetBindings {
             text,
             value,
             src,
+            frame_row,
+            frame_count,
+            draw_x,
+            draw_y,
             style,
         })
     }

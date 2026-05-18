@@ -1,9 +1,9 @@
 //! Data source engine: turns config [`DataSource`] entries into live
 //! [`SourceSnapshot`] readings the renderer can bind against.
 //!
-//! This milestone implements the `time`, `battery`, and shell command source
-//! kinds. Other system sources parse and validate but produce empty snapshots
-//! until a later milestone.
+//! This milestone implements the `time`, `battery`, shell command, and
+//! unix-socket listen source kinds. Other system sources parse and validate but
+//! produce empty snapshots until a later milestone.
 
 use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
 
@@ -43,7 +43,9 @@ pub fn poll_source_with_dir(source: &DataSource, cwd: &Path) -> SourceSnapshot {
         SourceKind::Time => time_fields(),
         SourceKind::Battery => read_battery(Path::new(POWER_SUPPLY_BASE)),
         SourceKind::Shell => poll_shell(source, cwd),
-        SourceKind::Cpu | SourceKind::Memory | SourceKind::Network => BTreeMap::new(),
+        SourceKind::Cpu | SourceKind::Memory | SourceKind::Network | SourceKind::UnixSocket => {
+            BTreeMap::new()
+        }
     };
     snapshot
 }
@@ -63,10 +65,83 @@ pub fn tick_interval(sources: &[DataSource]) -> Duration {
 
 /// Parse one shell command output into fields for a source snapshot.
 pub fn parse_shell_output(format: SourceFormat, output: &str) -> BTreeMap<String, String> {
+    parse_source_output(format, output)
+}
+
+/// Parse one source output line into snapshot fields.
+pub fn parse_source_output(format: SourceFormat, output: &str) -> BTreeMap<String, String> {
     match format {
         SourceFormat::Text => BTreeMap::from([("value".to_string(), output.trim().to_string())]),
         SourceFormat::Json => parse_json_fields(output),
+        SourceFormat::HyprlandEvent => parse_hyprland_event_line(output),
     }
+}
+
+/// Parse one Hyprland socket2 event line.
+pub fn parse_hyprland_event_line(line: &str) -> BTreeMap<String, String> {
+    let raw = line.trim();
+    let mut fields = BTreeMap::from([("raw".to_string(), raw.to_string())]);
+    let Some((event, payload)) = raw.split_once(">>") else {
+        return fields;
+    };
+
+    fields.insert("event".to_string(), event.to_string());
+    fields.insert("payload".to_string(), payload.to_string());
+
+    match event {
+        "workspacev2" | "createworkspacev2" | "destroyworkspacev2" => {
+            let (id, name) = split_first_payload(payload);
+            fields.insert("workspace_id".to_string(), id.to_string());
+            fields.insert("workspace_name".to_string(), name.to_string());
+            append_workspace_styles(&mut fields, id);
+        }
+        "workspace" | "createworkspace" | "destroyworkspace" | "renameworkspace" => {
+            fields.insert("workspace_name".to_string(), payload.to_string());
+        }
+        "activewindowv2" | "windowtitlev2" | "openwindow" | "closewindow" | "movewindowv2"
+        | "urgent" => {
+            let (address, rest) = split_first_payload(payload);
+            fields.insert("window_address".to_string(), address.to_string());
+            if !rest.is_empty() {
+                fields.insert("window_payload".to_string(), rest.to_string());
+            }
+        }
+        "activewindow" => {
+            let (class, title) = split_first_payload(payload);
+            fields.insert("window_class".to_string(), class.to_string());
+            fields.insert("window_title".to_string(), title.to_string());
+        }
+        _ => {}
+    }
+
+    fields
+}
+
+fn split_first_payload(payload: &str) -> (&str, &str) {
+    payload
+        .split_once(',')
+        .map(|(first, rest)| (first.trim(), rest.trim()))
+        .unwrap_or((payload.trim(), ""))
+}
+
+fn append_workspace_styles(fields: &mut BTreeMap<String, String>, active_id: &str) {
+    for index in 1..=10 {
+        let is_active = active_id.parse::<u8>().ok() == Some(index);
+        let style = if is_active {
+            active_workspace_style()
+        } else {
+            inactive_workspace_style()
+        };
+        fields.insert(format!("workspace{index}_style"), style.to_string());
+    }
+}
+
+fn active_workspace_style() -> &'static str {
+    "color: var(--ctp-mantle); background: var(--ctp-green); border-color: color-mix(in srgb, var(--ctp-green) 85%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--ctp-green) 16%, transparent)"
+}
+
+fn inactive_workspace_style() -> &'static str {
+    "color: var(--ctp-peach); background: var(--ctp-surface0); border-color: var(--ctp-surface1); box-shadow: none"
 }
 
 fn poll_shell(source: &DataSource, cwd: &Path) -> BTreeMap<String, String> {
@@ -74,10 +149,11 @@ fn poll_shell(source: &DataSource, cwd: &Path) -> BTreeMap<String, String> {
         return BTreeMap::new();
     };
 
+    let effective_cwd: &Path = source.working_dir.as_deref().unwrap_or(cwd);
     let Ok(output) = Command::new("sh")
         .arg("-c")
         .arg(command)
-        .current_dir(cwd)
+        .current_dir(effective_cwd)
         .output()
     else {
         return BTreeMap::new();
@@ -162,6 +238,61 @@ fn read_sys_value(path: &Path) -> Option<String> {
     Some(value.trim().to_string())
 }
 
+/// Query `hyprctl activeworkspace -j` once and return a seed snapshot for every
+/// `unix_socket` + `HyprlandEvent` listen source in `sources`.
+///
+/// Returns an empty `Vec` when `hyprctl` is absent or fails so callers need no
+/// error handling. This seeds `workspace_name`, `workspace_id`, and all
+/// `workspace{n}_style` fields before the live socket delivers its first event.
+pub fn seed_listen_snapshots(sources: &[DataSource]) -> Vec<SourceSnapshot> {
+    let hyprland_sources: Vec<&DataSource> = sources
+        .iter()
+        .filter(|s| s.mode == SourceMode::Listen && s.format == SourceFormat::HyprlandEvent)
+        .collect();
+
+    if hyprland_sources.is_empty() {
+        return vec![];
+    }
+
+    let Ok(output) = Command::new("hyprctl")
+        .args(["activeworkspace", "-j"])
+        .output()
+    else {
+        return vec![];
+    };
+
+    if !output.status.success() {
+        return vec![];
+    }
+
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return vec![];
+    };
+
+    let Some(id) = json.get("id").and_then(|v| v.as_i64()) else {
+        return vec![];
+    };
+
+    let name = json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = if name.is_empty() { id.to_string() } else { name };
+
+    let fields =
+        parse_source_output(SourceFormat::HyprlandEvent, &format!("workspacev2>>{id},{name}"));
+
+    hyprland_sources
+        .into_iter()
+        .map(|source| {
+            let mut snapshot = SourceSnapshot::new(&source.id);
+            snapshot.fields = fields.clone();
+            snapshot
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +361,8 @@ mod tests {
                 interval_ms: Some(1000),
                 timeout_ms: None,
                 command: None,
+                path: None,
+                working_dir: None,
             },
             DataSource {
                 id: "battery".into(),
@@ -239,6 +372,8 @@ mod tests {
                 interval_ms: Some(5000),
                 timeout_ms: None,
                 command: None,
+                path: None,
+                working_dir: None,
             },
             DataSource {
                 id: "metadata".into(),
@@ -248,6 +383,8 @@ mod tests {
                 interval_ms: Some(10),
                 timeout_ms: None,
                 command: Some("printf '{}'".into()),
+                path: None,
+                working_dir: None,
             },
         ];
 
@@ -289,6 +426,8 @@ mod tests {
             interval_ms: None,
             timeout_ms: None,
             command: Some("cat value.txt".into()),
+            path: None,
+            working_dir: None,
         };
 
         let snapshot = poll_source_with_dir(&source, dir.path());
@@ -297,5 +436,91 @@ mod tests {
             snapshot.fields.get("value").map(String::as_str),
             Some("hello")
         );
+    }
+
+    #[test]
+    fn parses_hyprland_workspace_event() {
+        let fields = parse_hyprland_event_line("workspacev2>>2,web\n");
+
+        assert_eq!(
+            fields.get("raw").map(String::as_str),
+            Some("workspacev2>>2,web")
+        );
+        assert_eq!(fields.get("event").map(String::as_str), Some("workspacev2"));
+        assert_eq!(fields.get("payload").map(String::as_str), Some("2,web"));
+        assert_eq!(fields.get("workspace_id").map(String::as_str), Some("2"));
+        assert_eq!(
+            fields.get("workspace_name").map(String::as_str),
+            Some("web")
+        );
+        assert!(
+            fields
+                .get("workspace2_style")
+                .is_some_and(|style| style.contains("background: var(--ctp-green)"))
+        );
+        assert!(
+            fields
+                .get("workspace1_style")
+                .is_some_and(|style| style.contains("background: var(--ctp-surface0)"))
+        );
+    }
+
+    #[test]
+    fn parses_hyprland_active_window_event() {
+        let fields = parse_hyprland_event_line("activewindowv2>>0xabc123");
+
+        assert_eq!(
+            fields.get("event").map(String::as_str),
+            Some("activewindowv2")
+        );
+        assert_eq!(
+            fields.get("window_address").map(String::as_str),
+            Some("0xabc123")
+        );
+    }
+
+    #[test]
+    fn malformed_hyprland_event_keeps_raw_line() {
+        let fields = parse_hyprland_event_line("not an event");
+
+        assert_eq!(fields.get("raw").map(String::as_str), Some("not an event"));
+        assert!(!fields.contains_key("event"));
+    }
+
+    #[test]
+    fn seed_listen_snapshots_is_empty_with_no_hyprland_sources() {
+        let sources = vec![DataSource {
+            id: "clock".into(),
+            kind: SourceKind::Time,
+            mode: SourceMode::Poll,
+            format: SourceFormat::Text,
+            interval_ms: Some(1000),
+            timeout_ms: None,
+            command: None,
+            path: None,
+            working_dir: None,
+        }];
+        assert!(seed_listen_snapshots(&sources).is_empty());
+    }
+
+    #[test]
+    fn seed_listen_snapshots_does_not_panic_without_hyprctl() {
+        let sources = vec![DataSource {
+            id: "hypr_events".into(),
+            kind: SourceKind::UnixSocket,
+            mode: SourceMode::Listen,
+            format: SourceFormat::HyprlandEvent,
+            interval_ms: Some(1000),
+            timeout_ms: None,
+            command: None,
+            path: None,
+            working_dir: None,
+        }];
+        // Returns empty (no hyprctl in CI) or valid snapshots (live Hyprland session).
+        let snapshots = seed_listen_snapshots(&sources);
+        for snap in &snapshots {
+            assert_eq!(snap.id, "hypr_events");
+            assert!(snap.fields.contains_key("workspace_id"));
+        }
     }
 }

@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use widgex_core::{
-    Config, diagnostics_to_string, load_validated_config, renderer_payload_from_config,
-    schema_json_pretty,
+    diagnostics_to_string, load_validated_config, renderer_payload_from_config, schema_json_pretty,
+    Config,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +60,16 @@ enum Command {
         toggle: bool,
         window: Option<String>,
     },
+    Renderer {
+        #[arg(long)]
+        foreground: bool,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long = "window")]
+        window: Vec<String>,
+    },
     Schema,
     Doctor,
     Daemon {
@@ -89,6 +99,12 @@ enum DaemonCommand {
         dry_run: bool,
     },
     Stop {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Reload {
         #[arg(long)]
         socket: Option<PathBuf>,
         #[arg(long)]
@@ -204,6 +220,40 @@ fn run_cli(cli: Cli) -> Result<CliOutput> {
                 Ok(CliOutput::Message("widget window closed".to_string()))
             }
         }
+        Command::Renderer {
+            foreground,
+            config,
+            socket,
+            window,
+        } => {
+            if !foreground {
+                return Err(anyhow!("renderer subcommand must be run with --foreground"));
+            }
+            let config_path = config.unwrap_or_else(default_config_path);
+            let config = load_validated_config(&config_path)
+                .map_err(|diags| anyhow!(diagnostics_to_string(&diags)))?;
+            let payload = renderer_payload_from_config(&config)
+                .map_err(|diags| anyhow!(diagnostics_to_string(&diags)))?;
+            let config_dir = config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            let allow_shell = config.permissions.allow_shell;
+            let window_ids: Vec<&str> = if window.is_empty() {
+                payload.windows.iter().map(|w| w.id.as_str()).collect()
+            } else {
+                window.iter().map(String::as_str).collect()
+            };
+            widgex_webview::run_renderer(
+                &payload,
+                &config_dir,
+                &config.sources,
+                allow_shell,
+                &socket,
+                &window_ids,
+            )?;
+            Ok(CliOutput::Message(String::new()))
+        }
         Command::Schema => Ok(CliOutput::Json(schema_json_pretty::<Config>()?)),
         Command::Doctor => Ok(CliOutput::Message(doctor_report())),
         Command::Daemon { command } => Ok(CliOutput::Message(match command {
@@ -245,6 +295,20 @@ fn run_cli(cli: Cli) -> Result<CliOutput> {
                     let response =
                         widgex_ipc::send_request(&socket, &widgex_ipc::DaemonRequest::Stop)?;
                     response.message
+                }
+            }
+            DaemonCommand::Reload { socket, dry_run } => {
+                let socket = socket.unwrap_or_else(widgex_ipc::default_socket_path);
+                if dry_run {
+                    format!("would reload daemon at {}", socket.display())
+                } else {
+                    let response =
+                        widgex_ipc::send_request(&socket, &widgex_ipc::DaemonRequest::Reload)?;
+                    if response.ok {
+                        format_daemon_response(response)
+                    } else {
+                        return Err(anyhow!(response.message));
+                    }
                 }
             }
         })),

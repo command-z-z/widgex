@@ -18,8 +18,8 @@ body,
   height: 100%;
   display: flex;
   align-items: center;
-  padding: 0 12px;
-  background: rgba(18, 22, 31, 0.92);
+  padding: 0;
+  background: transparent;
 }
 
 .widgex-box {

@@ -56,12 +56,10 @@ fn daemon_keeps_previous_config_when_reload_fails() {
 
     assert!(error.to_string().contains("unsupported config version"));
     assert_eq!(status.window_ids, vec!["top-bar"]);
-    assert!(
-        status
-            .last_error
-            .unwrap()
-            .contains("unsupported config version")
-    );
+    assert!(status
+        .last_error
+        .unwrap()
+        .contains("unsupported config version"));
 }
 
 #[test]
@@ -82,4 +80,20 @@ fn widget_process_table_toggles_window_open_and_closed() {
         DaemonResponse::ok("opened desktop-clock").with_open_windows(vec!["desktop-clock".into()])
     );
     assert_eq!(second, DaemonResponse::ok("closed desktop-clock"));
+}
+
+#[test]
+fn widget_process_table_reload_preserves_open_windows() {
+    let mut table = WidgetProcessTable::default();
+    table.apply_request(&DaemonRequest::Open {
+        window_id: Some("desktop-clock".to_string()),
+        toggle: false,
+    });
+
+    let response = table.apply_request(&DaemonRequest::Reload);
+
+    assert_eq!(
+        response,
+        DaemonResponse::ok("daemon reloaded").with_open_windows(vec!["desktop-clock".into()])
+    );
 }

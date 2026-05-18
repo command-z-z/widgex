@@ -1,7 +1,7 @@
 use std::fs;
 
 use tempfile::tempdir;
-use widgex::{CliOutput, run};
+use widgex::{run, CliOutput};
 
 #[test]
 fn init_writes_a_valid_top_bar_template() {
@@ -182,6 +182,19 @@ fn daemon_start_dry_run_reports_binary_and_socket() {
             assert!(message.contains("widgex.sock"));
         }
         other => panic!("expected daemon dry-run message, got {other:?}"),
+    }
+}
+
+#[test]
+fn daemon_reload_dry_run_reports_socket() {
+    let output = run(["widgex", "daemon", "reload", "--dry-run"]).unwrap();
+
+    match output {
+        CliOutput::Message(message) => {
+            assert!(message.contains("would reload daemon"));
+            assert!(message.contains("widgex.sock"));
+        }
+        other => panic!("expected daemon reload dry-run message, got {other:?}"),
     }
 }
 
