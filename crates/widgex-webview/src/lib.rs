@@ -677,22 +677,36 @@ fn handle_control_request(
             Some((RendererResponse::ok(format!("reloaded {count} windows")), false))
         }
         RendererRequest::Close { window_id } => {
-            // Borrow safety: we extract the ManagedWindow from state while
-            // holding borrow_mut, then DROP the guard before calling
-            // gtk_window.destroy(). This ensures that if the connect_destroy
-            // callback (which borrows destroyed_ids) somehow also touched
-            // state, there would be no active mutable borrow of state at that
-            // point. destroyed_ids is a separate RefCell so is not affected.
+            // Borrow safety: extract the ManagedWindow from state while holding
+            // borrow_mut, then drop the guard before any GObject calls.
             let extracted = state.borrow_mut().windows.remove(&window_id);
             // `state` borrow_mut guard is dropped here — before destroy().
             if let Some(managed) = extracted {
                 let will_be_empty = state.borrow().windows.is_empty();
-                // destroy() fires connect_destroy callbacks synchronously.
-                // No borrow_mut on state or destroyed_ids is held at this point.
-                // SAFETY: we have exclusive ownership of this window; it is no
-                // longer referenced by any other part of the program after
-                // removal from state.windows above.
+
+                // Step 1: terminate the WebKitWebProcess explicitly.
+                // webkit2gtk may keep the WebKitNetworkProcess alive until the
+                // last WebProcess referencing a WebContext exits. Calling
+                // terminate_web_process() here ensures the process dies
+                // immediately rather than waiting for GObject finalization to
+                // cascade through WebContext's refcount asynchronously.
+                #[cfg(target_os = "linux")]
+                if let ManagedWindow::Webkit { ref webview, .. } = managed {
+                    use wry::WebViewExtUnix;
+                    webview.webview().terminate_web_process();
+                }
+
+                // Step 2: destroy the GTK window (removes it from compositor).
+                // SAFETY: we have exclusive ownership; the window is no longer
+                // in state.windows above.
                 unsafe { managed.gtk_window().destroy() };
+
+                // Step 3: drop ManagedWindow to release wry::WebView (and its
+                // internal WebKitWebView GObject reference). Combined with the
+                // explicit terminate above, this ensures the WebKitWebContext
+                // refcount hits zero and the NetworkProcess is cleaned up.
+                drop(managed);
+
                 // The connect_destroy callback may have inserted window_id into
                 // destroyed_ids. Remove it so the tick loop skips it.
                 destroyed_ids.borrow_mut().remove(&window_id);
