@@ -4,3 +4,4 @@
 /apps/renderer/dist/
 /.worktrees/
 /.widgex/
+.gstack/

@@ -248,6 +248,7 @@ fn run_cli(cli: Cli) -> Result<CliOutput> {
             widgex_webview::run_renderer(
                 &payload,
                 &config_dir,
+                &config_path,
                 &config.sources,
                 allow_shell,
                 &socket,

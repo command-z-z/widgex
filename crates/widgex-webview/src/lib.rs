@@ -35,7 +35,8 @@ use rust_embed::RustEmbed;
 use serde::Deserialize;
 use widgex_core::{
     Action, AnchorEdge, DataSource, RendererPayload, RendererSource, RendererWidget,
-    RendererWindow, SourceKind, SourceMode, SourceSnapshot, WindowLayer, resolve_payload,
+    RendererWindow, SourceKind, SourceMode, SourceSnapshot, WindowLayer, load_validated_config,
+    renderer_payload_from_config, resolve_payload,
 };
 
 mod native_renderer;
@@ -267,6 +268,7 @@ struct RendererState {
     global_listen_snapshots: BTreeMap<String, SourceSnapshot>,
     base_payload: RendererPayload,
     config_dir: PathBuf,
+    config_path: PathBuf,
     allow_shell: bool,
 }
 
@@ -416,6 +418,7 @@ fn add_window(
 pub fn run_renderer(
     payload: &RendererPayload,
     config_dir: impl AsRef<Path>,
+    config_path: impl AsRef<Path>,
     sources: &[DataSource],
     allow_shell: bool,
     control_socket_path: &Path,
@@ -429,6 +432,7 @@ pub fn run_renderer(
     gtk::init().context("failed to initialize GTK")?;
 
     let config_dir = config_dir.as_ref().to_path_buf();
+    let config_path = config_path.as_ref().to_path_buf();
     let mut base = payload.clone();
     inline_theme_css(&mut base, &config_dir);
 
@@ -449,6 +453,7 @@ pub fn run_renderer(
         global_listen_snapshots: initial_listen,
         base_payload: base,
         config_dir: config_dir.clone(),
+        config_path,
         allow_shell,
     }));
 
@@ -648,6 +653,30 @@ fn handle_control_request(
                     false,
                 ));
             }
+
+            // Reload the target window's spec from disk so config edits
+            // (e.g. toggling native_render, changing layer/anchor) take
+            // effect on the next open without requiring daemon reload.
+            {
+                let config_path = state.borrow().config_path.clone();
+                if let Some(fresh_payload) = load_validated_config(&config_path)
+                    .ok()
+                    .and_then(|c| renderer_payload_from_config(&c).ok())
+                {
+                    let mut st = state.borrow_mut();
+                    if let Some(new_spec) =
+                        fresh_payload.windows.into_iter().find(|w| w.id == window_id)
+                    {
+                        if let Some(pos) =
+                            st.base_payload.windows.iter().position(|w| w.id == window_id)
+                        {
+                            st.base_payload.windows[pos] = new_spec;
+                        }
+                    }
+                }
+                // On read failure: silently fall back to the in-memory spec.
+            }
+
             let result = {
                 let st = state.borrow();
                 add_window(&window_id, &st, Rc::clone(destroyed_ids))
