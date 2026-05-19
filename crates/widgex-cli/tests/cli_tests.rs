@@ -1,7 +1,7 @@
 use std::fs;
 
 use tempfile::tempdir;
-use widgex::{run, CliOutput};
+use widgex::{CliOutput, run};
 
 #[test]
 fn init_writes_a_valid_top_bar_template() {

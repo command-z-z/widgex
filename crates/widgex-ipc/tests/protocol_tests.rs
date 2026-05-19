@@ -1,4 +1,4 @@
-use widgex_ipc::{default_socket_path, DaemonRequest, DaemonResponse};
+use widgex_ipc::{DaemonRequest, DaemonResponse, default_socket_path};
 
 #[test]
 fn open_toggle_request_round_trips_as_json_line() {

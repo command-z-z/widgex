@@ -56,10 +56,12 @@ fn daemon_keeps_previous_config_when_reload_fails() {
 
     assert!(error.to_string().contains("unsupported config version"));
     assert_eq!(status.window_ids, vec!["top-bar"]);
-    assert!(status
-        .last_error
-        .unwrap()
-        .contains("unsupported config version"));
+    assert!(
+        status
+            .last_error
+            .unwrap()
+            .contains("unsupported config version")
+    );
 }
 
 #[test]

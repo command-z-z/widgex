@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use widgex_core::{
-    diagnostics_to_string, load_validated_config, renderer_payload_from_config, schema_json_pretty,
-    Config,
+    Config, diagnostics_to_string, load_validated_config, renderer_payload_from_config,
+    schema_json_pretty,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

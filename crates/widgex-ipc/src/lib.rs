@@ -1,8 +1,11 @@
 use std::{
     env,
+    path::{Path, PathBuf},
+};
+#[cfg(unix)]
+use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
-    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -38,6 +41,7 @@ pub fn default_socket_path() -> PathBuf {
         .join("widgex.sock")
 }
 
+#[cfg(unix)]
 pub fn send_request(
     socket_path: impl AsRef<Path>,
     request: &DaemonRequest,
@@ -58,6 +62,28 @@ pub fn send_request(
         .read_line(&mut line)
         .context("failed to read daemon response")?;
     DaemonResponse::from_json_line(&line)
+}
+
+/// Windows: 通过 Named Pipe（`\\.\pipe\widgex`）向 daemon 发送请求。
+///
+/// 实现步骤：
+/// 1. `CreateFileW(pipe_name, GENERIC_READ | GENERIC_WRITE, ...)`
+/// 2. 写入 `request.to_json_line()` 字节
+/// 3. 读取一行响应 → `DaemonResponse::from_json_line`
+#[cfg(windows)]
+pub fn send_request(
+    _socket_path: impl AsRef<Path>,
+    _request: &DaemonRequest,
+) -> Result<DaemonResponse> {
+    todo!("Windows IPC: send_request via Named Pipe (CreateFileW + ReadFile/WriteFile)")
+}
+
+#[cfg(all(not(unix), not(windows)))]
+pub fn send_request(
+    _socket_path: impl AsRef<Path>,
+    _request: &DaemonRequest,
+) -> Result<DaemonResponse> {
+    anyhow::bail!("IPC not yet supported on this platform")
 }
 
 impl DaemonRequest {
@@ -105,8 +131,12 @@ impl DaemonResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RendererRequest {
-    Open { window_id: String },
-    Close { window_id: String },
+    Open {
+        window_id: String,
+    },
+    Close {
+        window_id: String,
+    },
     Stop,
     Status,
     /// Reload all webviews in-process. GTK windows stay open; only WebKitWebProcess restarts.
@@ -163,6 +193,7 @@ impl RendererResponse {
     }
 }
 
+#[cfg(unix)]
 pub fn send_renderer_request(
     socket_path: impl AsRef<Path>,
     request: &RendererRequest,
@@ -183,4 +214,23 @@ pub fn send_renderer_request(
         .read_line(&mut line)
         .context("failed to read renderer response")?;
     RendererResponse::from_json_line(&line)
+}
+
+/// Windows: 通过 Named Pipe（`\\.\pipe\widgex-renderer`）向 renderer 发送请求。
+///
+/// 实现与 `send_request` 相同，管道路径不同。
+#[cfg(windows)]
+pub fn send_renderer_request(
+    _socket_path: impl AsRef<Path>,
+    _request: &RendererRequest,
+) -> Result<RendererResponse> {
+    todo!("Windows IPC: send_renderer_request via Named Pipe")
+}
+
+#[cfg(all(not(unix), not(windows)))]
+pub fn send_renderer_request(
+    _socket_path: impl AsRef<Path>,
+    _request: &RendererRequest,
+) -> Result<RendererResponse> {
+    anyhow::bail!("IPC not yet supported on this platform")
 }

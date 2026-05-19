@@ -7,10 +7,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-gtk.workspace = true
 libc.workspace = true
-gtk-layer-shell.workspace = true
-gdk-pixbuf = "0.18"
 rust-embed = "8"
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +17,9 @@ widgex-source = { path = "../widgex-source" }
 wry = "0.55"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+gtk.workspace = true
+gtk-layer-shell.workspace = true
+gdk-pixbuf = "0.18"
 webkit2gtk = "=2.0.2"
 
 [dev-dependencies]

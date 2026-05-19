@@ -11,15 +11,8 @@
 
 use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, time::Duration};
 
-use gtk::{
-    cairo,
-    pango,
-    prelude::*,
-};
-use gtk_layer_shell::{Edge, KeyboardMode, LayerShell};
-use widgex_core::{AnchorEdge, Direction, RendererWidget, RendererWindow, WidgetKind};
-
-use crate::{map_edge, map_layer};
+use gtk::{cairo, pango, prelude::*};
+use widgex_core::{Direction, RendererWidget, RendererWindow, WidgetKind};
 
 // ── Sprite animation state ───────────────────────────────────────────────────
 
@@ -113,12 +106,8 @@ impl SpriteHandle {
             // frame tile is visible at the destination position.
             let tile_x = (s.frame % s.cols) * s.frame_width;
             let tile_y = s.row * s.frame_height;
-            ctx.set_source_surface(
-                &s.sheet,
-                (s.x - tile_x) as f64,
-                (s.y - tile_y) as f64,
-            )
-            .ok();
+            ctx.set_source_surface(&s.sheet, (s.x - tile_x) as f64, (s.y - tile_y) as f64)
+                .ok();
             ctx.paint().ok();
 
             gtk::glib::Propagation::Proceed
@@ -187,7 +176,7 @@ fn pixbuf_to_cairo_surface(pb: &gdk_pixbuf::Pixbuf) -> Option<cairo::ImageSurfac
                 let a = if has_alpha { pixels[s + 3] } else { 255u8 };
                 // Cairo ARgb32 (little-endian): B G R A, premultiplied
                 let af = a as f32 / 255.0;
-                data[d]     = (b as f32 * af) as u8;
+                data[d] = (b as f32 * af) as u8;
                 data[d + 1] = (g as f32 * af) as u8;
                 data[d + 2] = (r as f32 * af) as u8;
                 data[d + 3] = a;
@@ -239,19 +228,7 @@ impl NativeRenderer {
             win_spec.size.height.unwrap_or(200) as i32,
         );
 
-        window.init_layer_shell();
-        window.set_namespace("widgex-native");
-        window.set_layer(map_layer(win_spec.layer));
-        window.set_keyboard_mode(KeyboardMode::None);
-
-        for edge in [AnchorEdge::Top, AnchorEdge::Right, AnchorEdge::Bottom, AnchorEdge::Left] {
-            window.set_anchor(map_edge(edge), win_spec.anchor.contains(&edge));
-        }
-        window.set_layer_shell_margin(Edge::Top, win_spec.margin.top as i32);
-        window.set_layer_shell_margin(Edge::Right, win_spec.margin.right as i32);
-        window.set_layer_shell_margin(Edge::Bottom, win_spec.margin.bottom as i32);
-        window.set_layer_shell_margin(Edge::Left, win_spec.margin.left as i32);
-        window.set_exclusive_zone(win_spec.exclusive_zone.unwrap_or(0));
+        super::linux::apply_desktop_hints(&window, win_spec);
 
         if win_spec.click_through {
             let region = cairo::Region::create();
@@ -282,13 +259,19 @@ impl NativeRenderer {
         let mut labels: Vec<gtk::Label> = Vec::new();
         let mut sprites: Vec<SpriteHandle> = Vec::new();
 
-        if let Some(root) = build_gtk_tree(&win_spec.widgets, config_dir, &mut labels, &mut sprites) {
+        if let Some(root) = build_gtk_tree(&win_spec.widgets, config_dir, &mut labels, &mut sprites)
+        {
             window.add(&root);
         }
 
         window.show_all();
+        super::linux::apply_desktop_position(&window, win_spec);
 
-        Some(NativeRenderer { window, labels, sprites })
+        Some(NativeRenderer {
+            window,
+            labels,
+            sprites,
+        })
     }
 
     /// Called on each tick with the resolved widget tree (source templates already
@@ -463,10 +446,9 @@ fn strip_unsupported_props(css: &str) -> String {
     css.lines()
         .filter(|line| {
             let t = line.trim();
-            !UNSUPPORTED.iter().any(|prop| {
-                t.starts_with(prop)
-                    && t[prop.len()..].trim_start().starts_with(':')
-            })
+            !UNSUPPORTED
+                .iter()
+                .any(|prop| t.starts_with(prop) && t[prop.len()..].trim_start().starts_with(':'))
         })
         .collect::<Vec<_>>()
         .join("\n")

@@ -5,12 +5,20 @@
 //! unix-socket listen source kinds. Other system sources parse and validate but
 //! produce empty snapshots until a later milestone.
 
-use std::{collections::BTreeMap, fs, path::Path, process::{Command, Stdio}, thread, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::Path,
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
 
 use chrono::Local;
 use widgex_core::{DataSource, SourceFormat, SourceKind, SourceMode, SourceSnapshot};
 
 /// Where the Linux kernel exposes battery state.
+#[cfg(target_os = "linux")]
 const POWER_SUPPLY_BASE: &str = "/sys/class/power_supply";
 
 /// Fallback poll cadence when no source declares an `interval_ms`.
@@ -41,7 +49,16 @@ pub fn poll_source_with_dir(source: &DataSource, cwd: &Path) -> SourceSnapshot {
     let mut snapshot = SourceSnapshot::new(&source.id);
     snapshot.fields = match source.kind {
         SourceKind::Time => time_fields(),
-        SourceKind::Battery => read_battery(Path::new(POWER_SUPPLY_BASE)),
+        SourceKind::Battery => {
+            #[cfg(target_os = "linux")]
+            {
+                read_battery(Path::new(POWER_SUPPLY_BASE))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                BTreeMap::new()
+            }
+        }
         SourceKind::Shell => poll_shell(source, cwd),
         SourceKind::Cpu | SourceKind::Memory | SourceKind::Network | SourceKind::UnixSocket => {
             BTreeMap::new()
@@ -168,7 +185,9 @@ fn poll_shell(source: &DataSource, cwd: &Path) -> BTreeMap<String, String> {
     let _killer = thread::spawn(move || {
         thread::sleep(Duration::from_millis(timeout_ms));
         #[cfg(unix)]
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        unsafe {
+            libc::kill(pid, libc::SIGKILL)
+        };
     });
 
     let Ok(output) = child.wait_with_output() else {
@@ -179,7 +198,10 @@ fn poll_shell(source: &DataSource, cwd: &Path) -> BTreeMap<String, String> {
         return BTreeMap::new();
     }
 
-    parse_shell_output(source.format, String::from_utf8_lossy(&output.stdout).as_ref())
+    parse_shell_output(
+        source.format,
+        String::from_utf8_lossy(&output.stdout).as_ref(),
+    )
 }
 
 fn parse_json_fields(output: &str) -> BTreeMap<String, String> {
@@ -215,6 +237,7 @@ fn time_fields() -> BTreeMap<String, String> {
 /// `percent` (numeric `capacity`, laptop batteries), `level` (textual
 /// `capacity_level`, available on peripherals too), and `status`. Returns an
 /// empty map if no battery exists, so a desktop without one degrades gracefully.
+#[cfg(target_os = "linux")]
 fn read_battery(base: &Path) -> BTreeMap<String, String> {
     let Some(battery_dir) = first_battery_dir(base) else {
         return BTreeMap::new();
@@ -233,6 +256,7 @@ fn read_battery(base: &Path) -> BTreeMap<String, String> {
     fields
 }
 
+#[cfg(target_os = "linux")]
 fn first_battery_dir(base: &Path) -> Option<std::path::PathBuf> {
     let mut entries: Vec<_> = fs::read_dir(base)
         .ok()?
@@ -246,6 +270,7 @@ fn first_battery_dir(base: &Path) -> Option<std::path::PathBuf> {
         .find(|dir| read_sys_value(&dir.join("type")).as_deref() == Some("Battery"))
 }
 
+#[cfg(target_os = "linux")]
 fn read_sys_value(path: &Path) -> Option<String> {
     let value = fs::read_to_string(path).ok()?;
     Some(value.trim().to_string())
@@ -291,10 +316,16 @@ pub fn seed_listen_snapshots(sources: &[DataSource]) -> Vec<SourceSnapshot> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let name = if name.is_empty() { id.to_string() } else { name };
+    let name = if name.is_empty() {
+        id.to_string()
+    } else {
+        name
+    };
 
-    let fields =
-        parse_source_output(SourceFormat::HyprlandEvent, &format!("workspacev2>>{id},{name}"));
+    let fields = parse_source_output(
+        SourceFormat::HyprlandEvent,
+        &format!("workspacev2>>{id},{name}"),
+    );
 
     hyprland_sources
         .into_iter()
