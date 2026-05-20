@@ -395,22 +395,23 @@ impl WidgetProcessManager {
         // Ask the renderer to stop gracefully (best-effort).
         let _ = send_renderer_request(&self.renderer_socket, &RendererRequest::Stop);
 
-        // Kill the renderer process group unconditionally.
-        if let Some(ref mut child) = self.renderer_child {
+        if let Some(mut child) = self.renderer_child.take() {
             #[cfg(unix)]
             {
                 let pid = child.id() as i32;
                 // SAFETY: pid is the renderer's process group id because
                 // spawn_renderer uses process_group(0).
                 unsafe { libc::killpg(pid, libc::SIGTERM) };
+                // Give the renderer time to exit and let its listener reconnect
+                // threads observe the signal, then SIGKILL any survivors (including
+                // children spawned in the reconnect window).
+                thread::sleep(Duration::from_millis(200));
+                unsafe { libc::killpg(pid, libc::SIGKILL) };
             }
             #[cfg(not(unix))]
             {
                 let _ = child.kill();
             }
-        }
-
-        if let Some(mut child) = self.renderer_child.take() {
             let _ = child.wait();
         }
 

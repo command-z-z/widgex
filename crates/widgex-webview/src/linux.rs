@@ -12,14 +12,14 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::{self, BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::Component,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     rc::Rc,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
     time::Duration,
 };
@@ -174,9 +174,18 @@ pub fn run_widget_window(
 
     apply_desktop_hints(&window, &window_spec);
 
-    let listener_rx = start_listeners(sources, config_dir.clone());
+    let mut active_ids = HashSet::new();
+    collect_source_ids_from_widgets(&window_spec.widgets, &mut active_ids);
+    let active_sources: Vec<DataSource> = sources
+        .iter()
+        .filter(|s| active_ids.contains(&s.id))
+        .cloned()
+        .collect();
+
+    let (listener_tx, listener_rx) = mpsc::channel::<SourceSnapshot>();
+    start_listeners_into(&active_sources, config_dir.clone(), listener_tx);
     let mut latest_listen_snapshots: BTreeMap<String, SourceSnapshot> =
-        widgex_source::seed_listen_snapshots(sources)
+        widgex_source::seed_listen_snapshots(&active_sources)
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
@@ -222,7 +231,8 @@ pub fn run_widget_window(
     }
     window.connect_destroy(|_| gtk::main_quit());
 
-    let poll_rx = start_pollers(sources, config_dir.clone());
+    let (poll_tx, poll_rx) = mpsc::channel::<SourceSnapshot>();
+    start_pollers_into(&active_sources, config_dir.clone(), poll_tx);
     let mut latest_poll_snapshots = BTreeMap::<String, SourceSnapshot>::new();
     let push_webview = Rc::clone(&webview);
     let mut last_pushed_json = String::new();
@@ -281,6 +291,10 @@ struct RendererState {
     config_path: PathBuf,
     allow_shell: bool,
     web_context: WebContext,
+    all_sources: Vec<DataSource>,
+    poll_tx: Sender<SourceSnapshot>,
+    listener_tx: Sender<SourceSnapshot>,
+    running_source_ids: HashSet<String>,
 }
 
 enum ManagedWindow {
@@ -418,11 +432,20 @@ pub fn run_renderer(
     let mut base = payload.clone();
     inline_theme_css(&mut base, &config_dir);
 
-    let poll_rx = start_pollers(sources, config_dir.clone());
-    let listener_rx = start_listeners(sources, config_dir.clone());
+    let active_ids = source_ids_for_windows(&base, initial_window_ids);
+    let active_sources: Vec<DataSource> = sources
+        .iter()
+        .filter(|s| active_ids.contains(&s.id))
+        .cloned()
+        .collect();
+
+    let (poll_tx, poll_rx) = mpsc::channel::<SourceSnapshot>();
+    let (listener_tx, listener_rx) = mpsc::channel::<SourceSnapshot>();
+    start_pollers_into(&active_sources, config_dir.clone(), poll_tx.clone());
+    start_listeners_into(&active_sources, config_dir.clone(), listener_tx.clone());
 
     let initial_listen: BTreeMap<String, SourceSnapshot> =
-        widgex_source::seed_listen_snapshots(sources)
+        widgex_source::seed_listen_snapshots(&active_sources)
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
@@ -436,6 +459,10 @@ pub fn run_renderer(
         config_path,
         allow_shell,
         web_context: WebContext::default(),
+        all_sources: sources.to_vec(),
+        poll_tx,
+        listener_tx,
+        running_source_ids: active_ids,
     }));
 
     let destroyed_ids: Rc<RefCell<BTreeSet<String>>> = Rc::new(RefCell::new(BTreeSet::new()));
@@ -666,6 +693,39 @@ fn handle_control_request(
                         .borrow_mut()
                         .windows
                         .insert(window_id.clone(), managed);
+
+                    // Start any sources needed by this window that aren't running yet.
+                    let (missing, poll_tx, listener_tx, config_dir) = {
+                        let mut st = state.borrow_mut();
+                        let needed =
+                            source_ids_for_windows(&st.base_payload, &[window_id.as_str()]);
+                        let missing: Vec<DataSource> = st
+                            .all_sources
+                            .iter()
+                            .filter(|s| {
+                                needed.contains(&s.id) && !st.running_source_ids.contains(&s.id)
+                            })
+                            .cloned()
+                            .collect();
+                        let poll_tx = st.poll_tx.clone();
+                        let listener_tx = st.listener_tx.clone();
+                        let config_dir = st.config_dir.clone();
+                        st.running_source_ids
+                            .extend(missing.iter().map(|s| s.id.clone()));
+                        (missing, poll_tx, listener_tx, config_dir)
+                    };
+                    if !missing.is_empty() {
+                        for snap in widgex_source::seed_listen_snapshots(&missing) {
+                            state
+                                .borrow_mut()
+                                .global_listen_snapshots
+                                .entry(snap.id.clone())
+                                .or_insert(snap);
+                        }
+                        start_pollers_into(&missing, config_dir.clone(), poll_tx);
+                        start_listeners_into(&missing, config_dir, listener_tx);
+                    }
+
                     Some((RendererResponse::ok(format!("opened {window_id:?}")), false))
                 }
                 Err(e) => Some((
@@ -785,10 +845,46 @@ pub fn execute_action(
     Ok(())
 }
 
+// ── Source dependency helpers ─────────────────────────────────────────────────
+
+fn source_ids_for_windows(payload: &RendererPayload, window_ids: &[&str]) -> HashSet<String> {
+    let id_set: HashSet<&str> = window_ids.iter().copied().collect();
+    let mut out = HashSet::new();
+    for window in &payload.windows {
+        if id_set.contains(window.id.as_str()) {
+            collect_source_ids_from_widgets(&window.widgets, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_source_ids_from_widgets(widgets: &[RendererWidget], out: &mut HashSet<String>) {
+    for widget in widgets {
+        if let Some(b) = &widget.bindings {
+            for refs in [
+                &b.text,
+                &b.value,
+                &b.src,
+                &b.frame_row,
+                &b.frame_count,
+                &b.draw_x,
+                &b.draw_y,
+                &b.style,
+            ] {
+                for r in refs.iter() {
+                    if let Some(id) = r.split('.').next() {
+                        out.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        collect_source_ids_from_widgets(&widget.children, out);
+    }
+}
+
 // ── Source listeners ─────────────────────────────────────────────────────────
 
-fn start_listeners(sources: &[DataSource], cwd: PathBuf) -> Receiver<SourceSnapshot> {
-    let (tx, rx) = mpsc::channel();
+fn start_listeners_into(sources: &[DataSource], cwd: PathBuf, tx: Sender<SourceSnapshot>) {
     for source in sources
         .iter()
         .filter(|s| s.mode == SourceMode::Listen)
@@ -806,7 +902,6 @@ fn start_listeners(sources: &[DataSource], cwd: PathBuf) -> Receiver<SourceSnaps
             _ => {}
         }
     }
-    rx
 }
 
 fn listen_shell_source(source: DataSource, cwd: PathBuf, tx: mpsc::Sender<SourceSnapshot>) {
@@ -953,8 +1048,7 @@ fn expand_env_vars(input: &str) -> String {
 
 // ── Source pollers ────────────────────────────────────────────────────────────
 
-fn start_pollers(sources: &[DataSource], cwd: PathBuf) -> Receiver<SourceSnapshot> {
-    let (tx, rx) = mpsc::channel();
+fn start_pollers_into(sources: &[DataSource], cwd: PathBuf, tx: Sender<SourceSnapshot>) {
     for source in sources
         .iter()
         .filter(|s| s.mode == SourceMode::Poll)
@@ -973,7 +1067,6 @@ fn start_pollers(sources: &[DataSource], cwd: PathBuf) -> Receiver<SourceSnapsho
             }
         });
     }
-    rx
 }
 
 fn drain_listener_snapshots(
@@ -1149,7 +1242,7 @@ pub(crate) fn map_edge(edge: AnchorEdge) -> Edge {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_relative_path, start_listeners};
+    use super::{is_safe_relative_path, start_listeners_into};
     use std::{io::Write, os::unix::net::UnixListener, thread, time::Duration};
     use widgex_core::{DataSource, SourceFormat, SourceKind, SourceMode};
 
@@ -1182,7 +1275,8 @@ mod tests {
             working_dir: None,
         }];
 
-        let rx = start_listeners(&sources, dir.path().to_path_buf());
+        let (tx, rx) = std::sync::mpsc::channel();
+        start_listeners_into(&sources, dir.path().to_path_buf(), tx);
         let snapshot = rx.recv_timeout(Duration::from_secs(1)).unwrap();
         server.join().unwrap();
 
@@ -1222,7 +1316,8 @@ mod tests {
             let (mut stream, _) = first_listener.accept().unwrap();
             writeln!(stream, "workspacev2>>1,main").unwrap();
         });
-        let rx = start_listeners(&sources, dir.path().to_path_buf());
+        let (tx, rx) = std::sync::mpsc::channel();
+        start_listeners_into(&sources, dir.path().to_path_buf(), tx);
         let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
         first_server.join().unwrap();
         std::fs::remove_file(&socket_path).unwrap();
@@ -1267,7 +1362,8 @@ mod tests {
             working_dir: None,
         }];
 
-        let rx = start_listeners(&sources, dir.path().to_path_buf());
+        let (tx, rx) = std::sync::mpsc::channel();
+        start_listeners_into(&sources, dir.path().to_path_buf(), tx);
         let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let second = rx.recv_timeout(Duration::from_secs(1)).unwrap();
         server.join().unwrap();
