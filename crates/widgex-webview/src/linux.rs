@@ -15,11 +15,16 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     io::{self, BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
+    os::unix::process::CommandExt,
     path::Component,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     rc::Rc,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::Duration,
 };
@@ -52,6 +57,7 @@ struct RendererAsset;
 
 const DEFAULT_WIDTH: u32 = 320;
 const DEFAULT_HEIGHT: u32 = 120;
+const RENDERER_TICK_MS: u64 = 100;
 
 // ── Display backend detection ────────────────────────────────────────────────
 
@@ -237,7 +243,7 @@ pub fn run_widget_window(
     let push_webview = Rc::clone(&webview);
     let mut last_pushed_json = String::new();
     let mut last_push = std::time::Instant::now();
-    gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
+    gtk::glib::timeout_add_local(Duration::from_millis(RENDERER_TICK_MS), move || {
         let mut dirty = false;
         while let Ok(snapshot) = poll_rx.try_recv() {
             latest_poll_snapshots.insert(snapshot.id.clone(), snapshot);
@@ -292,9 +298,7 @@ struct RendererState {
     allow_shell: bool,
     web_context: WebContext,
     all_sources: Vec<DataSource>,
-    poll_tx: Sender<SourceSnapshot>,
-    listener_tx: Sender<SourceSnapshot>,
-    running_source_ids: HashSet<String>,
+    source_workers: SourceWorkers,
 }
 
 enum ManagedWindow {
@@ -441,8 +445,9 @@ pub fn run_renderer(
 
     let (poll_tx, poll_rx) = mpsc::channel::<SourceSnapshot>();
     let (listener_tx, listener_rx) = mpsc::channel::<SourceSnapshot>();
-    start_pollers_into(&active_sources, config_dir.clone(), poll_tx.clone());
-    start_listeners_into(&active_sources, config_dir.clone(), listener_tx.clone());
+    let mut source_workers =
+        SourceWorkers::new(config_dir.clone(), poll_tx.clone(), listener_tx.clone());
+    source_workers.reconcile(sources, active_ids.clone());
 
     let initial_listen: BTreeMap<String, SourceSnapshot> =
         widgex_source::seed_listen_snapshots(&active_sources)
@@ -460,9 +465,7 @@ pub fn run_renderer(
         allow_shell,
         web_context: WebContext::default(),
         all_sources: sources.to_vec(),
-        poll_tx,
-        listener_tx,
-        running_source_ids: active_ids,
+        source_workers,
     }));
 
     let destroyed_ids: Rc<RefCell<BTreeSet<String>>> = Rc::new(RefCell::new(BTreeSet::new()));
@@ -496,7 +499,7 @@ pub fn run_renderer(
     let state_tick = Rc::clone(&state);
     let destroyed_tick = Rc::clone(&destroyed_ids);
     let mut last_push = std::time::Instant::now();
-    gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
+    gtk::glib::timeout_add_local(Duration::from_millis(RENDERER_TICK_MS), move || {
         // ── Drain destroyed-window notifications ──────────────────────────
         {
             let killed = std::mem::take(&mut *destroyed_tick.borrow_mut());
@@ -514,6 +517,10 @@ pub fn run_renderer(
                     webview.webview().terminate_web_process();
                 }
                 drop(managed);
+                {
+                    let mut st = state_tick.borrow_mut();
+                    reconcile_sources_for_open_windows(&mut st);
+                }
                 if is_empty {
                     gtk::main_quit();
                     return gtk::glib::ControlFlow::Break;
@@ -695,24 +702,19 @@ fn handle_control_request(
                         .insert(window_id.clone(), managed);
 
                     // Start any sources needed by this window that aren't running yet.
-                    let (missing, poll_tx, listener_tx, config_dir) = {
+                    let missing = {
                         let mut st = state.borrow_mut();
-                        let needed =
-                            source_ids_for_windows(&st.base_payload, &[window_id.as_str()]);
+                        let needed = source_ids_for_open_windows(&st);
                         let missing: Vec<DataSource> = st
                             .all_sources
                             .iter()
                             .filter(|s| {
-                                needed.contains(&s.id) && !st.running_source_ids.contains(&s.id)
+                                needed.contains(&s.id) && !st.source_workers.is_running(&s.id)
                             })
                             .cloned()
                             .collect();
-                        let poll_tx = st.poll_tx.clone();
-                        let listener_tx = st.listener_tx.clone();
-                        let config_dir = st.config_dir.clone();
-                        st.running_source_ids
-                            .extend(missing.iter().map(|s| s.id.clone()));
-                        (missing, poll_tx, listener_tx, config_dir)
+                        reconcile_sources_for_open_windows(&mut st);
+                        missing
                     };
                     if !missing.is_empty() {
                         for snap in widgex_source::seed_listen_snapshots(&missing) {
@@ -722,8 +724,6 @@ fn handle_control_request(
                                 .entry(snap.id.clone())
                                 .or_insert(snap);
                         }
-                        start_pollers_into(&missing, config_dir.clone(), poll_tx);
-                        start_listeners_into(&missing, config_dir, listener_tx);
                     }
 
                     Some((RendererResponse::ok(format!("opened {window_id:?}")), false))
@@ -767,6 +767,7 @@ fn handle_control_request(
                 drop(managed);
 
                 destroyed_ids.borrow_mut().remove(&window_id);
+                reconcile_sources_for_open_windows(&mut state.borrow_mut());
                 Some((
                     RendererResponse::ok(format!("closed {window_id:?}")),
                     will_be_empty,
@@ -882,7 +883,99 @@ fn collect_source_ids_from_widgets(widgets: &[RendererWidget], out: &mut HashSet
     }
 }
 
+fn source_ids_for_open_windows(state: &RendererState) -> HashSet<String> {
+    let window_ids: Vec<&str> = state.windows.keys().map(String::as_str).collect();
+    source_ids_for_windows(&state.base_payload, &window_ids)
+}
+
+fn reconcile_sources_for_open_windows(state: &mut RendererState) {
+    let needed = source_ids_for_open_windows(state);
+    state
+        .source_workers
+        .reconcile(&state.all_sources, needed.clone());
+    state
+        .global_poll_snapshots
+        .retain(|source_id, _| needed.contains(source_id));
+    state
+        .global_listen_snapshots
+        .retain(|source_id, _| needed.contains(source_id));
+}
+
 // ── Source listeners ─────────────────────────────────────────────────────────
+
+struct SourceWorker {
+    stop: Arc<AtomicBool>,
+}
+
+impl SourceWorker {
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+struct SourceWorkers {
+    cwd: PathBuf,
+    poll_tx: Sender<SourceSnapshot>,
+    listener_tx: Sender<SourceSnapshot>,
+    workers: BTreeMap<String, SourceWorker>,
+}
+
+impl SourceWorkers {
+    fn new(
+        cwd: PathBuf,
+        poll_tx: Sender<SourceSnapshot>,
+        listener_tx: Sender<SourceSnapshot>,
+    ) -> Self {
+        Self {
+            cwd,
+            poll_tx,
+            listener_tx,
+            workers: BTreeMap::new(),
+        }
+    }
+
+    fn reconcile(&mut self, sources: &[DataSource], needed: HashSet<String>) {
+        let stale: Vec<String> = self
+            .workers
+            .keys()
+            .filter(|id| !needed.contains(*id))
+            .cloned()
+            .collect();
+        for id in stale {
+            if let Some(worker) = self.workers.remove(&id) {
+                worker.stop();
+            }
+        }
+
+        for source in sources.iter().filter(|source| needed.contains(&source.id)) {
+            if self.workers.contains_key(&source.id) {
+                continue;
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            spawn_source_worker(
+                source.clone(),
+                self.cwd.clone(),
+                self.poll_tx.clone(),
+                self.listener_tx.clone(),
+                Arc::clone(&stop),
+            );
+            self.workers
+                .insert(source.id.clone(), SourceWorker { stop });
+        }
+    }
+
+    fn is_running(&self, source_id: &str) -> bool {
+        self.workers.contains_key(source_id)
+    }
+}
+
+impl Drop for SourceWorkers {
+    fn drop(&mut self) {
+        for (_, worker) in std::mem::take(&mut self.workers) {
+            worker.stop();
+        }
+    }
+}
 
 fn start_listeners_into(sources: &[DataSource], cwd: PathBuf, tx: Sender<SourceSnapshot>) {
     for source in sources
@@ -890,24 +983,85 @@ fn start_listeners_into(sources: &[DataSource], cwd: PathBuf, tx: Sender<SourceS
         .filter(|s| s.mode == SourceMode::Listen)
         .cloned()
     {
-        let tx = tx.clone();
-        let cwd = cwd.clone();
         match source.kind {
             SourceKind::Shell => {
-                thread::spawn(move || listen_shell_source(source, cwd, tx));
+                spawn_listen_shell_source(
+                    source,
+                    cwd.clone(),
+                    tx.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                );
             }
             SourceKind::UnixSocket => {
-                thread::spawn(move || listen_unix_socket_source(source, cwd, tx));
+                spawn_listen_unix_socket_source(
+                    source,
+                    cwd.clone(),
+                    tx.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                );
             }
             _ => {}
         }
     }
 }
 
-fn listen_shell_source(source: DataSource, cwd: PathBuf, tx: mpsc::Sender<SourceSnapshot>) {
+fn spawn_source_worker(
+    source: DataSource,
+    cwd: PathBuf,
+    poll_tx: Sender<SourceSnapshot>,
+    listener_tx: Sender<SourceSnapshot>,
+    stop: Arc<AtomicBool>,
+) {
+    match (source.mode, source.kind) {
+        (SourceMode::Poll, _) => spawn_poll_source(source, cwd, poll_tx, stop),
+        (SourceMode::Listen, SourceKind::Shell) => {
+            spawn_listen_shell_source(source, cwd, listener_tx, stop);
+        }
+        (SourceMode::Listen, SourceKind::UnixSocket) => {
+            spawn_listen_unix_socket_source(source, cwd, listener_tx, stop);
+        }
+        _ => {}
+    }
+}
+
+fn spawn_poll_source(
+    source: DataSource,
+    cwd: PathBuf,
+    tx: mpsc::Sender<SourceSnapshot>,
+    stop: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let interval = Duration::from_millis(source.interval_ms.unwrap_or(1000).max(100));
+        while !stop.load(Ordering::Relaxed) {
+            let snapshot = widgex_source::poll_source_with_dir(&source, &cwd);
+            if tx.send(snapshot).is_err() {
+                break;
+            }
+            if sleep_until_stopped(&stop, interval) {
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_listen_shell_source(
+    source: DataSource,
+    cwd: PathBuf,
+    tx: mpsc::Sender<SourceSnapshot>,
+    stop: Arc<AtomicBool>,
+) {
+    thread::spawn(move || listen_shell_source(source, cwd, tx, stop));
+}
+
+fn listen_shell_source(
+    source: DataSource,
+    cwd: PathBuf,
+    tx: mpsc::Sender<SourceSnapshot>,
+    stop: Arc<AtomicBool>,
+) {
     let effective_cwd: PathBuf = source.working_dir.clone().unwrap_or(cwd);
     let mut fields_cache = BTreeMap::new();
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         let Some(command) = source.command.as_deref() else {
             return;
         };
@@ -917,6 +1071,7 @@ fn listen_shell_source(source: DataSource, cwd: PathBuf, tx: mpsc::Sender<Source
             .current_dir(&effective_cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn()
         {
             Ok(child) => child,
@@ -925,41 +1080,99 @@ fn listen_shell_source(source: DataSource, cwd: PathBuf, tx: mpsc::Sender<Source
                 return;
             }
         };
+        let pid = child.id() as libc::pid_t;
+        let child_done = Arc::new(AtomicBool::new(false));
+        let stop_child = Arc::clone(&stop);
+        let child_done_for_killer = Arc::clone(&child_done);
+        thread::spawn(move || {
+            while !stop_child.load(Ordering::Relaxed)
+                && !child_done_for_killer.load(Ordering::Relaxed)
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if stop_child.load(Ordering::Relaxed) && !child_done_for_killer.load(Ordering::Relaxed)
+            {
+                unsafe {
+                    libc::killpg(pid, libc::SIGTERM);
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+        });
 
         let Some(stdout) = child.stdout.take() else {
             let _ = child.wait();
+            child_done.store(true, Ordering::Relaxed);
             return;
         };
 
-        for line in BufReader::new(stdout)
-            .lines()
-            .map_while(std::result::Result::ok)
-        {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        while !stop.load(Ordering::Relaxed) {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let line = line.trim_end_matches(&['\r', '\n'][..]);
             if send_source_line(&source, &line, &mut fields_cache, &tx).is_err() {
                 let _ = child.kill();
                 let _ = child.wait();
+                child_done.store(true, Ordering::Relaxed);
                 return;
             }
         }
 
         let _ = child.wait();
-        thread::sleep(reconnect_interval(&source));
+        child_done.store(true, Ordering::Relaxed);
+        if sleep_until_stopped(&stop, reconnect_interval(&source)) {
+            break;
+        }
     }
 }
 
-fn listen_unix_socket_source(source: DataSource, cwd: PathBuf, tx: mpsc::Sender<SourceSnapshot>) {
+fn spawn_listen_unix_socket_source(
+    source: DataSource,
+    cwd: PathBuf,
+    tx: mpsc::Sender<SourceSnapshot>,
+    stop: Arc<AtomicBool>,
+) {
+    thread::spawn(move || listen_unix_socket_source(source, cwd, tx, stop));
+}
+
+fn listen_unix_socket_source(
+    source: DataSource,
+    cwd: PathBuf,
+    tx: mpsc::Sender<SourceSnapshot>,
+    stop: Arc<AtomicBool>,
+) {
     let mut fields_cache = BTreeMap::new();
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         let Some(path) = source.path.as_deref() else {
             return;
         };
         let path = source_path(path, &cwd);
         match UnixStream::connect(&path) {
             Ok(stream) => {
-                for line in BufReader::new(stream)
-                    .lines()
-                    .map_while(std::result::Result::ok)
-                {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while !stop.load(Ordering::Relaxed) {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                    let line = line.trim_end_matches(&['\r', '\n'][..]);
                     if send_source_line(&source, &line, &mut fields_cache, &tx).is_err() {
                         return;
                     }
@@ -973,8 +1186,25 @@ fn listen_unix_socket_source(source: DataSource, cwd: PathBuf, tx: mpsc::Sender<
                 );
             }
         }
-        thread::sleep(reconnect_interval(&source));
+        if sleep_until_stopped(&stop, reconnect_interval(&source)) {
+            break;
+        }
     }
+}
+
+fn sleep_until_stopped(stop: &AtomicBool, duration: Duration) -> bool {
+    let step = Duration::from_millis(50);
+    let mut slept = Duration::ZERO;
+    while slept < duration {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        let remaining = duration.saturating_sub(slept);
+        let nap = remaining.min(step);
+        thread::sleep(nap);
+        slept += nap;
+    }
+    stop.load(Ordering::Relaxed)
 }
 
 fn send_source_line(
@@ -1242,9 +1472,82 @@ pub(crate) fn map_edge(edge: AnchorEdge) -> Edge {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_relative_path, start_listeners_into};
+    use super::{
+        SourceWorkers, is_safe_relative_path, source_ids_for_windows, start_listeners_into,
+    };
     use std::{io::Write, os::unix::net::UnixListener, thread, time::Duration};
-    use widgex_core::{DataSource, SourceFormat, SourceKind, SourceMode};
+    use widgex_core::{
+        DataSource, RendererPayload, RendererWidget, RendererWidgetBindings, RendererWindow,
+        SourceFormat, SourceKind, SourceMode, WidgetKind,
+    };
+
+    fn test_source(id: &str, mode: SourceMode) -> DataSource {
+        DataSource {
+            id: id.into(),
+            kind: SourceKind::Shell,
+            mode,
+            format: SourceFormat::Text,
+            interval_ms: Some(100),
+            timeout_ms: None,
+            command: Some("printf ready".into()),
+            path: None,
+            working_dir: None,
+        }
+    }
+
+    fn label_window(id: &str, binding: &str) -> RendererWindow {
+        RendererWindow {
+            id: id.into(),
+            title: None,
+            layer: widgex_core::WindowLayer::Top,
+            anchor: Vec::new(),
+            margin: Default::default(),
+            size: Default::default(),
+            exclusive_zone: None,
+            click_through: false,
+            monitor: None,
+            native_render: false,
+            working_dir: None,
+            widgets: vec![RendererWidget {
+                kind: WidgetKind::Label,
+                id: None,
+                class: Vec::new(),
+                text: Some(binding.into()),
+                value: None,
+                src: None,
+                frame_width: None,
+                frame_height: None,
+                cols: None,
+                frame_row: None,
+                frame_count: None,
+                draw_x: None,
+                draw_y: None,
+                frame_durations: Vec::new(),
+                style: None,
+                direction: None,
+                on_click: None,
+                on_change: None,
+                on_right_click: None,
+                on_scroll_up: None,
+                on_scroll_down: None,
+                bindings: Some(RendererWidgetBindings {
+                    text: vec![binding.trim_matches(&['{', '}', ' '][..]).into()],
+                    ..Default::default()
+                }),
+                children: Vec::new(),
+            }],
+        }
+    }
+
+    fn payload_with_windows(windows: Vec<RendererWindow>) -> RendererPayload {
+        RendererPayload {
+            version: 1,
+            theme_css: None,
+            theme_css_files: Vec::new(),
+            windows,
+            sources: Vec::new(),
+        }
+    }
 
     #[test]
     fn config_asset_paths_reject_traversal_and_absolute_paths() {
@@ -1252,6 +1555,47 @@ mod tests {
         assert!(is_safe_relative_path("./spotify_cache/default.png"));
         assert!(!is_safe_relative_path("../secret"));
         assert!(!is_safe_relative_path("/etc/passwd"));
+    }
+
+    #[test]
+    fn source_ids_for_windows_unions_multiple_open_windows() {
+        let payload = payload_with_windows(vec![
+            label_window("top-bar", "{{ top_bar.cpu }}"),
+            label_window("swaync-panel", "{{ swaync.dnd_label }}"),
+            label_window("weather", "{{ weather.temp }}"),
+        ]);
+
+        let ids = source_ids_for_windows(&payload, &["top-bar", "swaync-panel"]);
+
+        assert!(ids.contains("top_bar"));
+        assert!(ids.contains("swaync"));
+        assert!(!ids.contains("weather"));
+    }
+
+    #[test]
+    fn source_workers_reconcile_stops_sources_not_needed_by_open_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (poll_tx, _poll_rx) = std::sync::mpsc::channel();
+        let (listener_tx, _listener_rx) = std::sync::mpsc::channel();
+        let sources = vec![
+            test_source("top_bar", SourceMode::Poll),
+            test_source("swaync", SourceMode::Listen),
+        ];
+        let mut workers = SourceWorkers::new(dir.path().to_path_buf(), poll_tx, listener_tx);
+
+        workers.reconcile(
+            &sources,
+            ["top_bar".to_string(), "swaync".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        assert!(workers.is_running("top_bar"));
+        assert!(workers.is_running("swaync"));
+
+        workers.reconcile(&sources, ["top_bar".to_string()].into_iter().collect());
+
+        assert!(workers.is_running("top_bar"));
+        assert!(!workers.is_running("swaync"));
     }
 
     #[test]
